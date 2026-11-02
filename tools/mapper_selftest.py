@@ -328,6 +328,24 @@ def main():
         names = res["EntityRef"]
         assert names == {"outer", "second"}, names
     n += 1
+    class DispIx:
+        """The fake index plus a `Display` fact for one made-up error type."""
+        def __init__(self, base, yes):
+            self.base, self.yes = base, yes
+
+        def __getattr__(self, k):
+            return getattr(self.base, k)
+
+        def is_display(self, name):
+            return True if name in self.yes else self.base.is_display(name)
+
+    assert ix.is_display("NoSuchType") is None
+    MD = g.Mapper(DispIx(ix, {"Oops"}))
+    i = MD.map_ty(P("Result", P("String"), P("Oops")), "ret")
+    assert i.is_result and i.to_lua("x") == "x.map_err(lua_err)", i.to_lua("x")
+    skips(P("Result", P("String"), P("Nope")), "ret", "not `MissingComponentError`")
+    skips(P("Result", P("String"), P("Oops", P("T"))), "ret", "not `MissingComponentError`")
+    n += 3
     print(f"mapper_selftest: OK ({n} checks)")
 
 

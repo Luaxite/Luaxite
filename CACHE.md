@@ -1,5 +1,5 @@
 proto: 2
-task: 3558860047
+task: 4018424446
 ## idx   path | purpose; symbols Lx-y | sig | prov@step (read|skim|inferred|unread)
 rust/main.rs | bin entry: `use luaxite_bind::bind;` L3-5, parse_args, signal handler, run per Runtime | 1251627317/3373 | read@5
 rust_binds/luau/mod.rs | glue (s10: CURRENT/TASK_LUA/current_lua near top, Runtime::lua; s9: `binds::register(&lua)` in with_source): Handlers, require shim, Runtime{lua,handlers} new/embedded/with_source L322-355 (Lua::new L346) | 686232666/12142 | skim@0
@@ -33,14 +33,15 @@ README.md | project readme | - | unread
 [P] env: cargo 1.97 STABLE works (`RUSTUP_TOOLCHAIN=stable`, as tools/env.sh does), nightly cannot be fetched offline; dep-free crates can be built for real, azalea/mlua builds unverified; .env exists = secrets, never read
 [P] conv: rustfmt style 4sp, edition 2024; stdlib-only python tools
 [P] skip: .git vendor target __pycache__ *.lock logo.svg harness/fake/rustdoc/azalea.json .env
-[T] baseline@1: check.sh OK; unittest 253 OK (~15s)
-[T] @3: cargo exists on PATH but rustup can't download offline -> test_bindgen_selftest fails (pre-existing, not a regression); 281 OK otherwise (282 total @4)
-[T] scan_text yields (label,line,fn,mode,params,ret)
-[T] rust/ already exists with main.rs + luau/; harness stays at harness/
-[T] harness/src/luau + tools/sync_harness.sh + check.sh step 5 must stay consistent with any rust_binds/luau/mod.rs edit
-[T] chain=12 (user swap@1): step_done 0-12, plan<=12 slices; lint regex step_done must allow 10-12
-[T] slice rule: easy-medium, 1 concern, small diff; split hard work, never push through
-[T] strip_comments.py is a script (mutates argv files on import): never import it
-[T] smoke tree /tmp/s2 is scratch; rebuild if needed
-[T] @10: no cargo on PATH this session; s10 Rust unverified by compiler (task_local!/Mutex static/scope); retry compile when a toolchain exists
-[T] @11: demo_binds.rs is the only //BIND file; harness copies it (sync_harness.sh); bind_e2e.sh rewrites `mod binds {..}` in a scratch generated.rs; still no cargo
+tools/rdj_index.py | rustdoc-JSON index; ImplData (clone_impls, display_impls); RdjIndex.is_clone L785, is_display L799 (s1) | 3728685936/46623 | read@1
+tools/luaxite_gen.py | generator; Mapper.map_ty Result branch ~L430 uses error_ok L456 (s1); not_clone after it; SCALAR/BUILTIN/CLASSES tables | 2493406394/103889 | skim@1
+tools/mapper_selftest.py | mapper checks vs harness/fake index; DispIx stub + Result tests L331 (s1); run by tests/py/test_bindings.py | 1766637035/19309 | read@1
+tools/coverage.toml | ledger of unbound azalea APIs: hand/todo/no rows per class | - | skim@1
+bindgen.toml | generator data tables (renames, records, accessors, hand_classes, handwritten_goals) | - | skim@1
+rust_binds/luau/extra_misc.rs | hand glue: ClientInformation FromLua (option-struct, s4 target), goto_reach | - | skim@1
+[P] cmd: unit=python3 -m unittest discover -s tests/py (~17s); mapper=python3 tools/mapper_selftest.py; check=SKIP_HARNESS=1 sh tools/check.sh
+[P] env: no cargo/rustc in sandbox: generated Rust only checkable by exact-text tests
+[P] conv: stdlib-only python, 4sp, rustfmt style rust
+[P] skip: .git vendor target __pycache__ *.lock logo.svg
+[T] baseline@1: unittest 396 tests, 2 pre-existing FAIL (test_generator GoldenScript.test_golden_compare_passes, Outputs.test_matches_golden_sha1_list: gen_client.rs sha) - not regressions
+[T] fake ix lacks is_display facts; tests inject via DispIx stub

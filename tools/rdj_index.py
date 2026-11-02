@@ -178,6 +178,7 @@ class ImplData:
     client_traits: set = field(default_factory=set)
     goal_impls: set = field(default_factory=set)
     clone_impls: set = field(default_factory=set)
+    display_impls: set = field(default_factory=set)
     macro_notes: list = field(default_factory=list)
     hidden: list = field(default_factory=list)
 
@@ -354,6 +355,8 @@ def build_impls(r: rdj.Rdj, crates=None, classes=None, strip_prefix: str = "", h
                 data.goal_impls.add(tname)
             if trait == "Clone":
                 data.clone_impls.add(tname)
+            if trait == "Display":
+                data.display_impls.add(tname)
             if tname not in classes:
                 continue
             if trait and tname == "Client":
@@ -777,6 +780,7 @@ class RdjIndex:
         self.digest = None
         self.rdj = None
         self.clone_impls: set = set()
+        self.display_impls: set = set()
         self.skipped_items: list = []
         self.discovered: dict = {}
         self.discover_skipped: list = []
@@ -791,6 +795,16 @@ class RdjIndex:
         if not ds:
             return None
         return any(re.search(r"\bClone\b", a) for d in ds for a in d.attrs)
+
+    def is_display(self, name: str):
+        """True/False like `is_clone`, for `Display` (a written `impl Display for T`, or `#[derive(Error)]` which writes one);
+        None when the type has no definition in the loaded crates."""
+        if name in self.display_impls:
+            return True
+        ds = self.defs.get(name)
+        if not ds:
+            return None
+        return any(re.search(r"\bError\b", a) for d in ds for a in d.attrs if a.startswith("#[derive"))
 
     def load(self):
         need = source_crates(self.root)
@@ -819,6 +833,7 @@ class RdjIndex:
         self.methods = impls.methods
         self.goal_impls, self.client_traits, self.macro_notes = impls.goal_impls, impls.client_traits, impls.macro_notes
         self.clone_impls = impls.clone_impls
+        self.display_impls = impls.display_impls
         self.hidden_fns = impls.hidden
         self.mod_pub, self.reexports, self.globs = self.paths.mod_pub, self.paths.reexports, self.paths.globs
 

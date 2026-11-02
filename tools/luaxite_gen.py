@@ -430,8 +430,8 @@ class Mapper:
         if name in ("Result", "AzaleaResult"):
             if role != "ret":
                 raise Skip("Result as parameter")
-            if name == "Result" and not (len(args) == 2 and args[1] == ("path", "MissingComponentError", [])):
-                raise Skip("Result with an error type other than MissingComponentError")
+            if name == "Result" and not (len(args) == 2 and self.error_ok(args[1])):
+                raise Skip("Result with an error type that is not `MissingComponentError` or a type known to implement Display")
             i = self.map_ty(args[0] if args else ("unit",), "ret")
             if i.is_result:
                 raise Skip("nested Result")
@@ -452,6 +452,13 @@ class Mapper:
         if args:
             raise Skip(f"generic type `{type_text(('path', name, args))}`")
         return self.named(name, role)
+
+    def error_ok(self, e) -> bool:
+        """`lua_err` takes any `Display`: MissingComponentError, or a plain path type the index knows implements Display."""
+        if e == ("path", "MissingComponentError", []):
+            return True
+        is_display = getattr(self.ix, "is_display", None)
+        return bool(e[0] == "path" and not e[2] and is_display is not None and is_display(e[1]) is True)
 
     def not_clone(self, t) -> Optional[str]:
         """The name of a type inside `t` that is known not to implement Clone (None: Clone, or can't tell)."""
