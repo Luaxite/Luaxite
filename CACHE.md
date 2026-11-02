@@ -33,9 +33,9 @@ README.md | project readme | - | unread
 [P] env: cargo 1.97 STABLE works (`RUSTUP_TOOLCHAIN=stable`, as tools/env.sh does), nightly cannot be fetched offline; dep-free crates can be built for real, azalea/mlua builds unverified; .env exists = secrets, never read
 [P] conv: rustfmt style 4sp, edition 2024; stdlib-only python tools
 [P] skip: .git vendor target __pycache__ *.lock logo.svg harness/fake/rustdoc/azalea.json .env
-tools/rdj_index.py | rustdoc-JSON index; ImplData (clone_impls, display_impls); RdjIndex.is_clone L785, is_display L799 (s1) | 3728685936/46623 | read@1
-tools/luaxite_gen.py | generator; Mapper.map_ty Result branch ~L430 uses error_ok L456 (s1); not_clone after it; SCALAR/BUILTIN/CLASSES tables | 2493406394/103889 | skim@1
-tools/mapper_selftest.py | mapper checks vs harness/fake index; DispIx stub + Result tests L331 (s1); run by tests/py/test_bindings.py | 1766637035/19309 | read@1
+tools/rdj_index.py | rustdoc-JSON index; ImplData (clone/display/default_impls); RdjIndex.is_clone L785, is_display, is_default L813 (s1,s2) | 1822266347/47309 | read@2
+tools/luaxite_gen.py | generator; Mapper.map_ty Result branch ~L430, error_ok, option_struct L463 (s2), not_clone; emit_types L1499 (enum/record wrappers: s3 adds option-struct FromLua here) | 1757231953/105440 | skim@2
+tools/mapper_selftest.py | mapper checks vs harness/fake index; DispIx stub + Result tests L331 (s1); option-struct tests L349 (s2, injects defs into ix.defs + PATH_OVERRIDES); run by tests/py/test_bindings.py | 3717185199/21886 | read@2
 tools/coverage.toml | ledger of unbound azalea APIs: hand/todo/no rows per class | - | skim@1
 bindgen.toml | generator data tables (renames, records, accessors, hand_classes, handwritten_goals) | - | skim@1
 rust_binds/luau/extra_misc.rs | hand glue: ClientInformation FromLua (option-struct, s4 target), goto_reach | - | skim@1

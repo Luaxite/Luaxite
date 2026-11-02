@@ -460,6 +460,32 @@ class Mapper:
         is_display = getattr(self.ix, "is_display", None)
         return bool(e[0] == "path" and not e[2] and is_display is not None and is_display(e[1]) is True)
 
+    def option_struct(self, name: str) -> dict:
+        """An options struct a script may pass as a table with only some keys: not generic, named pub fields (ASCII names), `Default`,
+        every field readable from Luau. Returns dict(name, path, fields=[(field, TypeInfo)]); raises Skip(reason) otherwise."""
+        d = self.ix.unique_def(name)
+        if d is None or d.kind != "struct":
+            raise Skip(f"`{name}`: no unique public struct definition")
+        if d.generics or d.tuple_style:
+            raise Skip(f"struct `{name}` is generic or a tuple struct")
+        if not d.fields or any(not f[2] for f in d.fields):
+            raise Skip(f"struct `{name}` has private fields")
+        is_default = getattr(self.ix, "is_default", None)
+        if is_default is None or is_default(name) is not True:
+            raise Skip(f"struct `{name}` is not known to implement Default (missing keys need a default)")
+        fields = []
+        for fname, ft, _ in d.fields:
+            if not ASCII_IDENT.fullmatch(bare(fname)):
+                raise Skip(f"struct `{name}`.{fname}: not a plain ASCII field name")
+            try:
+                fi = self.map_ty(ft, "param")
+            except Skip as e:
+                raise Skip(f"struct `{name}`.{fname}: {e.reason}")
+            if fi.is_result or fi.fallible_from or not fi.from_lua:
+                raise Skip(f"struct `{name}`.{fname}: cannot be read from Luau")
+            fields.append((bare(fname), fi))
+        return dict(name=name, path=self.path_for(name), fields=fields)
+
     def not_clone(self, t) -> Optional[str]:
         """The name of a type inside `t` that is known not to implement Clone (None: Clone, or can't tell)."""
         k = t[0]

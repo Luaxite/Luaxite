@@ -346,6 +346,51 @@ def main():
     skips(P("Result", P("String"), P("Nope")), "ret", "not `MissingComponentError`")
     skips(P("Result", P("String"), P("Oops", P("T"))), "ret", "not `MissingComponentError`")
     n += 3
+    # option structs: pub fields + Default + every field readable from Luau
+    mkd = lambda name, fields, attrs=(), generics=False, tuple_style=False: g.Def(
+        kind="struct", name=name, crate="azalea", modpath=(), is_pub=True, generics=generics, src=b"",
+        tuple_style=tuple_style, fields=fields, attrs=list(attrs))
+    good = [("language", P("String"), True), ("view_distance", ("prim", "u8"), True), ("chat_colors", ("prim", "bool"), True)]
+    cases = {
+        "OptGood": mkd("OptGood", good, ["#[derive(Clone, Default)]"]),
+        "OptNoDefault": mkd("OptNoDefault", good, ["#[derive(Clone)]"]),
+        "OptPrivate": mkd("OptPrivate", good + [("secret", ("prim", "u8"), False)], ["#[derive(Default)]"]),
+        "OptGeneric": mkd("OptGeneric", good, ["#[derive(Default)]"], generics=True),
+        "OptTuple": mkd("OptTuple", [("0", ("prim", "u8"), True)], ["#[derive(Default)]"], tuple_style=True),
+        "OptBadField": mkd("OptBadField", good + [("blob", P("NoSuchType"), True)], ["#[derive(Default)]"]),
+    }
+    for name, d in cases.items():
+        ix.defs[name] = [d]
+    ix.default_impls.add("OptHand")
+    ix.defs["OptHand"] = [mkd("OptHand", good)]
+    saved_po = dict(g.PATH_OVERRIDES)
+    g.PATH_OVERRIDES.update({k: f"azalea::{k}" for k in list(cases) + ["OptHand"]})
+    try:
+        Mo = g.Mapper(ix)
+        for name in ("OptGood", "OptHand"):
+            e = Mo.option_struct(name)
+            assert e["path"] == f"azalea::{name}" and [f[0] for f in e["fields"]] == ["language", "view_distance", "chat_colors"], e
+            assert [f[1].luau for f in e["fields"]] == ["string", "number", "boolean"], e
+        for name, why in (("OptNoDefault", "not known to implement Default"), ("OptPrivate", "private fields"),
+                          ("OptGeneric", "generic or a tuple"), ("OptTuple", "generic or a tuple"), ("OptBadField", "OptBadField`.blob")):
+            try:
+                Mo.option_struct(name)
+                raise AssertionError(f"{name} not refused")
+            except g.Skip as e:
+                assert why in str(e), (name, str(e))
+        try:
+            Mo.option_struct("NoSuchStruct")
+            raise AssertionError("unknown struct not refused")
+        except g.Skip as e:
+            assert "no unique public struct" in str(e), e
+    finally:
+        for name in list(cases) + ["OptHand"]:
+            ix.defs.pop(name, None)
+        ix.default_impls.discard("OptHand")
+        g.PATH_OVERRIDES.clear()
+        g.PATH_OVERRIDES.update(saved_po)
+    assert ix.is_default("NoSuchType") is None
+    n += 10
     print(f"mapper_selftest: OK ({n} checks)")
 
 
