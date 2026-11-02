@@ -449,6 +449,27 @@ def main():
             ix.defs.pop(k, None)
             g.PATH_OVERRIDES.pop(k, None)
     n += 5
+    # [option_structs] config: a listed name is read from a (partial) Luau table when it is a parameter
+    ix.defs["OptCfg"] = [mkd("OptCfg", [("language", P("String"), True)], ["#[derive(Default)]"])]
+    g.PATH_OVERRIDES["OptCfg"] = "azalea::OptCfg"
+    try:
+        assert "OPTION_STRUCTS" in vars(g) and g.OPTION_STRUCTS == g.load_config()["OPTION_STRUCTS"]
+        g.OPTION_STRUCTS["OptCfg"] = "test"
+        Mc = g.Mapper(ix)
+        i = Mc.map_ty(P("OptCfg"), "param")
+        assert i.rust == "LuaOptCfgOpts" and i.luau == "OptCfg" and i.from_lua("x") == "x.0", (i.rust, i.luau)
+        assert "OptCfg" in Mc.option_structs and ("type", "OptCfg") in Mc.touched
+        Mr = g.Mapper(ix)
+        try:
+            Mr.map_ty(P("OptCfg"), "ret")
+        except g.Skip:
+            pass
+        assert "OptCfg" not in Mr.option_structs
+    finally:
+        g.OPTION_STRUCTS.pop("OptCfg", None)
+        ix.defs.pop("OptCfg", None)
+        g.PATH_OVERRIDES.pop("OptCfg", None)
+    n += 5
     print(f"mapper_selftest: OK ({n} checks)")
 
 

@@ -1388,7 +1388,7 @@ def test_config_toml_schema_errors():
     base = (ROOT / "bindgen.toml").read_text()
     cfg = g.load_config()
     assert sorted(cfg) == sorted(["DENY_METHODS", "PATH_OVERRIDES", "RENAMES", "HANDWRITTEN_GOALS", "CLASSES", "EVENT_ARG_NAMES",
-                                  "HIDDEN_EVENTS", "GOAL_PARAM_NAMES", "SCALAR", "RECORDS", "ACCESSORS", "EXTRA_EVENTS", "EXTRA_EVENT_PAYLOADS", "HAND_CLASSES", "HAND_GLOBALS"])
+                                  "HIDDEN_EVENTS", "GOAL_PARAM_NAMES", "SCALAR", "RECORDS", "ACCESSORS", "EXTRA_EVENTS", "EXTRA_EVENT_PAYLOADS", "OPTION_STRUCTS", "HAND_CLASSES", "HAND_GLOBALS"])
     assert cfg["CLASSES"]["Client"]["renames"] is cfg["RENAMES"] and list(cfg["CLASSES"]) == ["Client", "EntityRef"]
     assert all(isinstance(r, tuple) and len(r) == 3 for rows in cfg["RECORDS"].values() for r in rows)
     d = Path(tmpdir())

@@ -75,6 +75,12 @@ goal = "GoalLib"
 azalea = "AzaleaLib"
 process = "ProcessLib"
 
+# Structs a script passes as a table with only some keys (the rest keep `Default`), used as a method parameter: the generator emits the table -> struct
+# conversion and the all-optional Luau type (struct needs pub fields + Default; a field that is itself such a struct is read as a nested table).
+# name = why. `set_client_information` stays hand-written (extra_misc.rs, reserved) until the hand code is removed: then the generator binds it.
+[option_structs]
+ClientInformation = "Bot:set_client_information(info); ModelCustomization is read as a nested table"
+
 # Parameter names for tuple-struct goals, by field type.
 [goal_param_names]
 BlockPos = "pos"

@@ -115,7 +115,7 @@ def load_config(path=None) -> dict:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} is not valid TOML: {e}") from None
     known = {"deny_methods", "classes", "scalar", "records", "accessors", *_STR_TABLES}
-    optional = {"extra_event_payloads"}
+    optional = {"extra_event_payloads", "option_structs"}
     for k in raw:
         if k not in known and k not in optional:
             raise ConfigError(f"unknown key `{k}` (expected one of: {', '.join(sorted(known | optional))})")
@@ -199,6 +199,7 @@ def load_config(path=None) -> dict:
         if t != "ClientboundPacket":
             raise ConfigError(f"key `extra_event_payloads.{n}`: unknown payload type `{t}` (only `ClientboundPacket`, the generated union of clientbound game packets)")
     out["EXTRA_EVENT_PAYLOADS"] = payloads
+    out["OPTION_STRUCTS"] = _str_table("option_structs", raw.get("option_structs", {}))
     return out
 
 
@@ -548,6 +549,9 @@ class Mapper:
         return out
 
     def named(self, name: str, role: str) -> TypeInfo:
+        if role == "param" and name in OPTION_STRUCTS:
+            e = self.use_option_struct(name)
+            return TypeInfo(e["rust"], name, from_lua=lambda x: f"{x}.0")
         if name == "Entity":
             cls = CLASSES["EntityRef"]
             nested = bool(self.building)

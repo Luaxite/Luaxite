@@ -76,6 +76,10 @@ Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)
 - `pub fn nearest_entities<F>(&self) -> AzaleaResult<Box<[EntityRef]>>`
 - `pub fn nearest_entities_by<Q: FakeQuery, F>(&self, predicate: impl Fn(Q::Item<'_>) -> bool) -> AzaleaResult<Box<[EntityRef]>>`
 
+#### `set_client_information` is hand-written (extra_*.rs) or generated elsewhere (1)
+
+- `pub fn set_client_information(&self, client_information: ClientInformation) -> AzaleaResult<()>`
+
 #### `tab_list` is hand-written (extra_*.rs) or generated elsewhere (1)
 
 - `pub fn tab_list(&self) -> AzaleaResult<std::collections::HashMap<Uuid, PlayerInfo>>`
@@ -87,10 +91,6 @@ Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)
 #### no `&self` receiver (1)
 
 - `pub fn fake() -> Self`
-
-#### parameter `client_information`: not convertible (1)
-
-- `pub fn set_client_information(&self, client_information: ClientInformation) -> AzaleaResult<()>`
 
 #### tuple struct `Account` (1)
 
