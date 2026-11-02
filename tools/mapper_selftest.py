@@ -391,6 +391,64 @@ def main():
         g.PATH_OVERRIDES.update(saved_po)
     assert ix.is_default("NoSuchType") is None
     n += 10
+    # option struct emission (Rust FromLua + Luau type), exact text
+    import types as _types
+    ix.defs["OptEmit"] = [mkd("OptEmit", [("language", P("String"), True), ("chat_colors", ("prim", "bool"), True), ("type", ("prim", "f32"), True)],
+                              ["#[derive(Default)]"])]
+    g.PATH_OVERRIDES["OptEmit"] = "azalea::OptEmit"
+    try:
+        Me = g.Mapper(ix)
+        e = Me.use_option_struct("OptEmit")
+        assert Me.use_option_struct("OptEmit") is e and e["rust"] == "LuaOptEmitOpts" and ("type", "OptEmit") in Me.touched
+        rs = g.emit_types(_types.SimpleNamespace(m=Me), "test")
+        for want in (
+            "pub struct LuaOptEmitOpts(pub azalea::OptEmit);",
+            "impl FromLua for LuaOptEmitOpts {",
+            "let mut out = azalea::OptEmit::default();",
+            '"language" => {\n                    let v = <String as FromLua>::from_lua(v, lua)\n'
+            '                        .map_err(|err| mlua::Error::runtime(format!("OptEmit.language: {err}")))?;\n'
+            "                    out.language = v;\n                }",
+            "out.chat_colors = v.0;",
+            "out.r#type = v;",
+            'format!("OptEmit: unknown field `{other}` (known: language, chat_colors, type)")',
+            'format!("OptEmit: expected a table, got {}", other.type_name())',
+        ):
+            assert want in rs, want
+        assert g.luau_option_struct("OptEmit", e) == "type OptEmit = { language: string?, chat_colors: boolean?, type: number? }"
+        for bad in ("Bot", "OptNoDefault"):
+            try:
+                g.Mapper(ix).use_option_struct(bad)
+                raise AssertionError(f"{bad} registered")
+            except g.Skip:
+                pass
+        assert "Opts" not in g.emit_types(_types.SimpleNamespace(m=g.Mapper(ix)), "test")
+    finally:
+        ix.defs.pop("OptEmit", None)
+        g.PATH_OVERRIDES.pop("OptEmit", None)
+    n += 6
+    # nested option struct: a field that is itself a Default struct is read from a nested table
+    ix.defs["OptInner"] = [mkd("OptInner", [("hat", ("prim", "bool"), True)], ["#[derive(Default)]"])]
+    ix.defs["OptOuter"] = [mkd("OptOuter", [("language", P("String"), True), ("skin", P("OptInner"), True)], ["#[derive(Default)]"])]
+    ix.defs["OptLoop"] = [mkd("OptLoop", [("again", P("OptLoop"), True)], ["#[derive(Default)]"])]
+    g.PATH_OVERRIDES.update({"OptInner": "azalea::OptInner", "OptOuter": "azalea::OptOuter", "OptLoop": "azalea::OptLoop"})
+    try:
+        Mn = g.Mapper(ix)
+        e = Mn.use_option_struct("OptOuter")
+        assert set(Mn.option_structs) == {"OptInner", "OptOuter"}, set(Mn.option_structs)
+        assert [f[0] for f in e["fields"]] == ["language", "skin"] and e["fields"][1][1].rust == "LuaOptInnerOpts"
+        rs = g.emit_types(_types.SimpleNamespace(m=Mn), "test")
+        assert "let v = <LuaOptInnerOpts as FromLua>::from_lua(v, lua)" in rs and "out.skin = v.0;" in rs, rs
+        assert g.luau_option_struct("OptOuter", e) == "type OptOuter = { language: string?, skin: OptInner? }"
+        try:
+            g.Mapper(ix).use_option_struct("OptLoop")
+            raise AssertionError("self-referential option struct accepted")
+        except g.Skip:
+            pass
+    finally:
+        for k in ("OptInner", "OptOuter", "OptLoop"):
+            ix.defs.pop(k, None)
+            g.PATH_OVERRIDES.pop(k, None)
+    n += 5
     print(f"mapper_selftest: OK ({n} checks)")
 
 

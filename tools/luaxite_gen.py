@@ -337,6 +337,8 @@ class Mapper:
         self.enums: dict[str, dict] = {}
         self.records: dict[str, dict] = {}
         self.tagged: dict[str, dict] = {}
+        self.option_structs: dict[str, dict] = {}
+        self.opt_stack: list = []
         self.enum_notes: list[str] = []
         self.cexpr = "self.client"
         self.client_flags: list[bool] = []
@@ -477,14 +479,42 @@ class Mapper:
         for fname, ft, _ in d.fields:
             if not ASCII_IDENT.fullmatch(bare(fname)):
                 raise Skip(f"struct `{name}`.{fname}: not a plain ASCII field name")
-            try:
-                fi = self.map_ty(ft, "param")
-            except Skip as e:
-                raise Skip(f"struct `{name}`.{fname}: {e.reason}")
+            fi = self.nested_option_struct(ft)
+            if fi is None:
+                try:
+                    fi = self.map_ty(ft, "param")
+                except Skip as e:
+                    raise Skip(f"struct `{name}`.{fname}: {e.reason}")
             if fi.is_result or fi.fallible_from or not fi.from_lua:
                 raise Skip(f"struct `{name}`.{fname}: cannot be read from Luau")
             fields.append((bare(fname), fi))
         return dict(name=name, path=self.path_for(name), fields=fields)
+
+    def nested_option_struct(self, ft) -> Optional[TypeInfo]:
+        """A field whose type is itself an option struct (plain path to a struct that is `Default`): read as a nested table. None: not one."""
+        if ft[0] != "path" or ft[2]:
+            return None
+        d = self.ix.unique_def(ft[1])
+        is_default = getattr(self.ix, "is_default", None)
+        if d is None or d.kind != "struct" or is_default is None or is_default(ft[1]) is not True or ft[1] in self.opt_stack:
+            return None
+        self.opt_stack.append(ft[1])
+        try:
+            e = self.use_option_struct(ft[1])
+        except Skip:
+            return None
+        finally:
+            self.opt_stack.pop()
+        return TypeInfo(e["rust"], ft[1], from_lua=lambda x: f"{x}.0")
+
+    def use_option_struct(self, name: str) -> dict:
+        """`option_struct(name)` registered for emission (`emit_types`: `Lua<Name>Opts`, `emit_dluau`: the table type) and marked used."""
+        if name not in self.option_structs:
+            if name in self.taken_luau_names() or name in self.enums or name in self.records or name in self.tagged:
+                raise Skip(f"`{name}` would redefine a Luau type that already exists")
+            self.option_structs[name] = dict(self.option_struct(name), rust=f"Lua{name}Opts")
+        self.touch(("type", name))
+        return self.option_structs[name]
 
     def not_clone(self, t) -> Optional[str]:
         """The name of a type inside `t` that is known not to implement Clone (None: Clone, or can't tell)."""
@@ -1496,6 +1526,51 @@ def emit_class(gen: Generator, cg: ClassGen) -> list:
     return L
 
 
+def emit_option_struct(name: str, e: dict) -> list:
+    """Rust for one option struct: a Luau table with any of the fields (the rest keep `Default`); an unknown key or a wrongly typed value is an error."""
+    r, p = e["rust"], e["path"]
+    known = ", ".join(f for f, _ in e["fields"])
+    L = [
+        f"/// `{name}` <- Luau table with any of: {known} (missing keys keep their `Default` value)",
+        f"pub struct {r}(pub {p});",
+        "",
+        f"impl FromLua for {r} {{",
+        "    fn from_lua(value: Value, lua: &Lua) -> mlua::Result<Self> {",
+        "        let t = match value {",
+        "            Value::Table(t) => t,",
+        f'            other => return Err(mlua::Error::runtime(format!("{name}: expected a table, got {{}}", other.type_name()))),',
+        "        };",
+        f"        let mut out = {p}::default();",
+        "        for pair in t.pairs::<String, Value>() {",
+        "            let (key, v) = pair?;",
+        "            match key.as_str() {",
+    ]
+    for f, fi in e["fields"]:
+        L += [
+            f'                "{f}" => {{',
+            f"                    let v = <{fi.rust} as FromLua>::from_lua(v, lua)",
+            f'                        .map_err(|err| mlua::Error::runtime(format!("{name}.{f}: {{err}}")))?;',
+            f"                    out.{rust_ident(f)} = {fi.from_lua('v')};",
+            "                }",
+        ]
+    L += [
+        f'                other => return Err(mlua::Error::runtime(format!("{name}: unknown field `{{other}}` (known: {known})"))),',
+        "            }",
+        "        }",
+        "        Ok(Self(out))",
+        "    }",
+        "}",
+        "",
+    ]
+    return L
+
+
+def luau_option_struct(name: str, e: dict) -> str:
+    """The Luau type of an option struct: every field optional."""
+    fs = ", ".join(f"{luau_field(f)}: {fi.luau if fi.luau.endswith('?') else fi.luau + '?'}" for f, fi in e["fields"])
+    return f"type {name} = {{ {fs} }}"
+
+
 def emit_types(gen: Generator, src_label: str) -> str:
     m = gen.m
     used = {n for k, n in m.touched if k == "type"}
@@ -1576,6 +1651,8 @@ def emit_types(gen: Generator, src_label: str) -> str:
                 L.append(f'                t.set("{fname}", {expr})?;')
             L.append("            }")
         L += ["            #[allow(unreachable_patterns)]", "            _ => {}", "        }", "        Ok(Value::Table(t))", "    }", "}", ""]
+    for name in sorted(n for n in m.option_structs if n in used):
+        L += emit_option_struct(name, m.option_structs[name])
     return "\n".join(L) + "\n"
 
 
@@ -1861,6 +1938,8 @@ def emit_dluau(gen: Generator, src_label: str, extras: dict) -> str:
             fs = [f'kind: "{v["kind"]}"'] + [f"{luau_field(f)}: {t}" for f, t, _e in v["fields"]]
             alts.append("{ " + ", ".join(fs) + " }")
         L += luau_union(name, alts)
+    for name in sorted(n for n in m.option_structs if n in used):
+        L.append(luau_option_struct(name, m.option_structs[name]))
     if gen.packets_in:
         for p in gen.packets_in:
             fs = [f'kind: "{p["name"]}"'] + [f"{luau_field(f)}: {t}" for f, t, _e in p["fields"]]

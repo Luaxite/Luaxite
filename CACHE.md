@@ -34,8 +34,8 @@ README.md | project readme | - | unread
 [P] conv: rustfmt style 4sp, edition 2024; stdlib-only python tools
 [P] skip: .git vendor target __pycache__ *.lock logo.svg harness/fake/rustdoc/azalea.json .env
 tools/rdj_index.py | rustdoc-JSON index; ImplData (clone/display/default_impls); RdjIndex.is_clone L785, is_display, is_default L813 (s1,s2) | 1822266347/47309 | read@2
-tools/luaxite_gen.py | generator; Mapper.map_ty Result branch ~L430, error_ok, option_struct L463 (s2), not_clone; emit_types L1499 (enum/record wrappers: s3 adds option-struct FromLua here) | 1757231953/105440 | skim@2
-tools/mapper_selftest.py | mapper checks vs harness/fake index; DispIx stub + Result tests L331 (s1); option-struct tests L349 (s2, injects defs into ix.defs + PATH_OVERRIDES); run by tests/py/test_bindings.py | 3717185199/21886 | read@2
+tools/luaxite_gen.py | generator; Mapper.map_ty Result branch ~L430, error_ok, option_struct L465, nested_option_struct L493, use_option_struct L510 (s2,s3); load_config L~95 (_STR_TABLES L76 maps toml table -> global e.g. PATH_OVERRIDES); emit_option_struct L1529, luau_option_struct L1568 (s3); emit_types/emit_dluau call them for Mapper.option_structs | 1583865980/109237 | skim@3
+tools/mapper_selftest.py | mapper checks vs harness/fake index; DispIx stub + Result tests L331 (s1); option-struct detect tests L349, emission L394, nested L429 (s2,s3; inject defs into ix.defs + PATH_OVERRIDES, mkd helper); run by tests/py/test_bindings.py | 547083636/25281 | read@3
 tools/coverage.toml | ledger of unbound azalea APIs: hand/todo/no rows per class | - | skim@1
 bindgen.toml | generator data tables (renames, records, accessors, hand_classes, handwritten_goals) | - | skim@1
 rust_binds/luau/extra_misc.rs | hand glue: ClientInformation FromLua (option-struct, s4 target), goto_reach | - | skim@1
