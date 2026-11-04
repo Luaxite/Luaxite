@@ -4,7 +4,7 @@
     "label": "fake @ 6e89eff471",
     "files": 1
   },
-  "front_end": "rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 61)",
+  "front_end": "rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)",
   "classes": [
     {
       "name": "Client",

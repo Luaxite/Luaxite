@@ -4,5 +4,5 @@ f0b5f1b6fd0011c02bb1cca161dc6179121884cb  rust/gen_client.rs
 3b4243ee7351fb8b507ab1921597dc45671e8813  rust/gen_events.rs
 f57cd68c55152fcf3b063582f8757bbd1b923fdb  rust/gen_types.rs
 7e5842253eefc0fa26e1b15c8573e5cc13bd2b79  luau/azalea.d.luau
-8a1f1f70552270ec4d5a814cc17f933dfa1523aa  luau/GEN_REPORT.json
-e562e57df342d271a64d13158c9d6500c7a34ec3  luau/GEN_REPORT.md
+6dc3e74d89c5b9a10ceb162d12370290a29798c5  luau/GEN_REPORT.json
+4a56da5d0ce6c64945f84b8a5fd56d3e46365633  luau/GEN_REPORT.md

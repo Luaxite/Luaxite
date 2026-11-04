@@ -1,7 +1,7 @@
 # Luau bridge report
 
 Source: `fake @ 6e89eff471` (1 files)
-Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 61)
+Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)
 
 - **`Client` -> `LuaClient` / `Bot`:** 47 methods generated (10 async/yielding), 11 skipped
 - **`EntityRef` -> `LuaEntityRef` / `Entity`:** 6 methods generated (0 async/yielding), 2 skipped

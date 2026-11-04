@@ -12,6 +12,9 @@ jobs:
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@v4
+              with:
+                  # tests/py/test_audit.py: .git/config must not hold credentials (the default checkout writes an `extraheader` token there)
+                  persist-credentials: false
             - uses: actions/setup-python@v5
               with:
                   python-version: "3.12"

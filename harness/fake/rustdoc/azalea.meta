@@ -1,4 +1,5 @@
 rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
 format_version: 57
+features: --all-features
 private_items: 1
-source_sha1: 4f0d7cd1e325160b6fec563b129fdae4c24b39d9
+source_sha1: fc19fe013dbad1957551e28497a5e3bfae067ff4

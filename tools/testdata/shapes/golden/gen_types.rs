@@ -100,7 +100,7 @@ impl<T: serde::de::DeserializeOwned> FromLua for LuaSerde<T> {
 
 /// A Luau callback that raised (or returned something its Rust type can't be read from, or yielded: mlua can't yield across the Rust frame
 /// that called it) cannot raise into the Rust code that called the closure: it is reported here, the closure returns `Default::default()`.
-fn lua_callback_error(what: &str, e: &mlua::Error) {
+pub(crate) fn lua_callback_error(what: &str, e: &mlua::Error) {
     eprintln!("[luaxite] {what} failed: {e}");
 }
 
