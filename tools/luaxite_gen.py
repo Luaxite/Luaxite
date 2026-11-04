@@ -3750,9 +3750,12 @@ def emit_dluau(gen: Generator, src_label: str, extras: dict) -> str:
             fs = [f'kind: "{v["kind"]}"'] + [f"{luau_field(f)}: {t}" for f, t, _e in v["fields"]]
             alts.append("{ " + ", ".join(fs) + " }")
         L += luau_union(name, alts)
-    for name in sorted(n for n in m.option_structs if n in used):
+    # A struct used both as a returned record and as an option-struct parameter (a Bevy component such as azalea's ClientInformation is
+    # reachable both ways) is one Luau name: luau-lsp rejects the whole .d.luau on `Redefinition of type`, so every global goes unknown.
+    # The record, emitted above, wins; the option struct's own `Lua<n>Opts` Rust type is unaffected.
+    for name in sorted(n for n in m.option_structs if n in used and n not in m.records and n not in m.tagged and n not in m.enums):
         L.append(luau_option_struct(name, m.option_structs[name]))
-    for name in sorted(n for n in m.vparams if n in used and n not in m.records and n not in m.tagged):   # a returned twin has the same text
+    for name in sorted(n for n in m.vparams if n in used and n not in m.records and n not in m.tagged and n not in m.option_structs):   # a returned twin has the same text
         e = m.vparams[name]
         if e["kind"] == "struct":
             L.append(f"type {name} = {{ " + ", ".join(f"{luau_field(f)}: {fi.luau}" for f, fi, _r in e["fields"]) + " }")

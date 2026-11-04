@@ -423,10 +423,27 @@ def main():
             except g.Skip:
                 pass
         assert "Opts" not in g.emit_types(_types.SimpleNamespace(m=g.Mapper(ix)), "test")
+        # a struct that is an option-struct parameter in one method and a returned record in another (azalea's ClientInformation is a
+        # component read and written): ONE `type OptEmit` line, or luau-lsp rejects the whole .d.luau ("Redefinition of type")
+        g.OPTION_STRUCTS["OptEmit"] = "test"
+        try:
+            for order in ("param first", "ret first"):
+                sg = g.Generator(ix)
+                ms = [g.Method("set_oe", "", True, False, False, "&self", [("a", P("OptEmit"))], None, "Client", "t.rs", "pub fn set_oe(&self)"),
+                      g.Method("get_oe", "", True, False, False, "&self", [], P("OptEmit"), "Client", "t.rs", "pub fn get_oe(&self)")]
+                for mm in (ms if order == "param first" else ms[::-1]):
+                    try:
+                        sg.build_method(mm)
+                    except g.Skip:   # ret first: the later param use is refused as a name clash (that guard already existed)
+                        assert order == "ret first", order
+                lu = g.emit_dluau(sg, "x", {})
+                assert lu.count("type OptEmit = ") == 1, (order, lu)
+        finally:
+            g.OPTION_STRUCTS.pop("OptEmit", None)
     finally:
         ix.defs.pop("OptEmit", None)
         g.PATH_OVERRIDES.pop("OptEmit", None)
-    n += 6
+    n += 7
     # nested option struct: a field that is itself a Default struct is read from a nested table
     ix.defs["OptInner"] = [mkd("OptInner", [("hat", ("prim", "bool"), True)], ["#[derive(Default)]"])]
     ix.defs["OptOuter"] = [mkd("OptOuter", [("language", P("String"), True), ("skin", P("OptInner"), True)], ["#[derive(Default)]"])]
