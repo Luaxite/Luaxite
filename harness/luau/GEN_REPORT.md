@@ -1,9 +1,9 @@
 # Luau bridge report
 
-Source: `fake @ 61bcab3d72` (1 files)
-Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)
+Source: `fake @ 6e89eff471` (1 files)
+Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 61)
 
-- **`Client` -> `LuaClient` / `Bot`:** 47 methods generated (10 async/yielding), 9 skipped
+- **`Client` -> `LuaClient` / `Bot`:** 47 methods generated (10 async/yielding), 11 skipped
 - **`EntityRef` -> `LuaEntityRef` / `Entity`:** 6 methods generated (0 async/yielding), 2 skipped
 - **azalea -> Luau:** 9 events (`bot:on(...)`)
 - **Types:** 14 generated conversions, 8 built-in
@@ -66,6 +66,16 @@ Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)
 
 - `ReachBlockPosGoal`: private fields; covered by `bot:goto_reach(pos, distance?)` in rust_binds/luau/extra_misc.rs
 
+## Skipped by code
+
+| code | methods |
+| --- | ---: |
+| `generic` | 4 |
+| `excluded` | 3 |
+| `closure` | 2 |
+| `receiver` | 2 |
+| `tuple_struct` | 2 |
+
 ## Skipped methods
 
 ### Client
@@ -75,6 +85,14 @@ Front end: rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)
 - `pub fn component<T: FakeComponent>(&self) -> Result<T, MissingComponentError>`
 - `pub fn nearest_entities<F>(&self) -> AzaleaResult<Box<[EntityRef]>>`
 - `pub fn nearest_entities_by<Q: FakeQuery, F>(&self, predicate: impl Fn(Q::Item<'_>) -> bool) -> AzaleaResult<Box<[EntityRef]>>`
+
+#### `impl Fn(Entity) -> bool` parameter (1)
+
+- `pub fn any_entity_by(&self, predicate: impl Fn(Entity) -> bool) -> Option<Entity>`
+
+#### `impl Fn(f32) -> f32` parameter (1)
+
+- `pub fn map_health(&self, f: impl Fn(f32) -> f32) -> f32`
 
 #### `set_client_information` is hand-written (extra_*.rs) or generated elsewhere (1)
 

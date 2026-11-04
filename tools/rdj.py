@@ -26,7 +26,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional
 
 FORMAT_TESTED = 57
 FORMAT_ACCEPTED = (57, 61)
@@ -449,12 +449,99 @@ def _generic_args(args) -> tuple:
     return out
 
 
-def convert_type(t) -> tuple:
-    """rustdoc JSON `Type` -> the generator's type AST tuple (see the block comment above).
+class PathTy(tuple):
+    """A ('path', last segment, args) node that also knows the full path of the type it names. It IS the 3-tuple (equality, indexing and
+    unpacking see only name and args), so every hand-built `("path", "Duration", [])` in the generator and its tests still
+    compares equal; `full` is metadata read through `getattr(t, "full", None)`: 'core::time::Duration' for std's, 'chrono::TimeDelta' for
+    another crate's, None when the JSON does not say (no `paths` entry and a bare written path: `Duration` imported by a `use`)."""
+    full: Optional[str] = None
 
-    resolved_path -> ('path', last segment, args)   primitive -> ('prim', n)   tuple [] -> ('unit',), else ('tuple', ..)
-    slice / array -> ('slice', t)   borrowed_ref immutable -> ('ref', t), mutable -> ('other', '&mut T')
-    impl_trait / dyn_trait -> ('impl', text)   generic / Self / qualified_path / function_pointer / raw_pointer /
+
+class FnSig(NamedTuple):
+    """The call signature of an `impl Fn(A, B) -> C` / `dyn FnMut(..)` bound (slice 25): kind = Fn | FnMut | FnOnce; inputs = type ASTs; output = type AST
+    or None (`()`); dyn = written `dyn` (not `impl`); send / sync / static = the `+ Send` / `+ Sync` / `+ 'static` bounds beside it."""
+    kind: str
+    inputs: tuple
+    output: Optional[tuple]
+    dyn: bool
+    send: bool
+    sync: bool
+    static: bool
+
+
+class ImplTy(tuple):
+    """An ('impl', text) node that also carries `fn`, the FnSig of a closure bound (None for any other `impl Trait` / `dyn Trait`). Like PathTy it IS
+    the 2-tuple: equality, indexing and unpacking see only the text, so hand-built `("impl", "impl Goal")` nodes still compare equal."""
+    fn: Optional["FnSig"] = None
+
+
+_FN_KINDS = ("Fn", "FnMut", "FnOnce")
+
+
+def _fn_sig(bounds, dyn: bool, c=None) -> Optional[FnSig]:
+    """FnSig when the bound list (impl: PathBound list; dyn: `traits` + `lifetime`) has exactly one parenthesized Fn-family trait; else None."""
+    found, send, sync, static = [], False, False, False
+    for tr, lt in bounds:
+        if lt:
+            static = static or lt == "'static"
+            continue
+        name = _last_seg((tr.get("path") or ""))
+        if name in _FN_KINDS and isinstance((tr.get("args") or {}).get("parenthesized"), dict):
+            found.append((name, tr["args"]["parenthesized"]))
+        elif name == "Send":
+            send = True
+        elif name == "Sync":
+            sync = True
+    if len(found) != 1:
+        return None
+    kind, pa = found[0]
+    out = pa.get("output")
+    ins = tuple(convert_type(i, c) for i in pa.get("inputs") or [])
+    return FnSig(kind, ins, None if out is None or convert_type(out, c) == ("unit",) else convert_type(out, c), dyn, send, sync, static)
+
+
+def _impl_node(t: dict, k: str, v, c=None) -> tuple:
+    node = ImplTy(("impl", render_type(t)))
+    bounds = []
+    if k == "impl_trait":
+        for b in v or []:
+            if isinstance(b, dict) and "trait_bound" in b and b["trait_bound"].get("modifier") not in ("maybe", "maybe_const"):
+                bounds.append((b["trait_bound"].get("trait") or {}, None))
+            elif isinstance(b, dict) and "outlives" in b:
+                bounds.append(({}, str(b["outlives"])))
+    elif isinstance(v, dict):
+        bounds = [((pt.get("trait") or {}), None) for pt in v.get("traits") or [] if isinstance(pt, dict)]
+        if v.get("lifetime"):
+            bounds.append(({}, str(v["lifetime"])))
+    node.fn = _fn_sig(bounds, k == "dyn_trait", c)
+    return node
+
+
+# Written paths that start inside the crate being documented: no crate name, so they say nothing about where the type lives.
+_RELATIVE_ROOTS = ("crate", "self", "super", "$crate")
+
+
+def _full_path(v: dict, c=None) -> Optional[str]:
+    """Full path of a `resolved_path` node: the `paths` summary of its `id` (`['core', 'time', 'Duration']`, the crate name first, also for
+    crates that are not loaded) when `c` has one, else the path as written when it names a crate (`chrono::Duration`), else None."""
+    i = v.get("id")
+    s = getattr(c, "paths", {}).get(i) if isinstance(i, int) and c is not None else None
+    p = s.get("path") if isinstance(s, dict) else None
+    if isinstance(p, list) and p and all(isinstance(x, str) and x for x in p):
+        return "::".join(p)
+    w = v.get("path")
+    if isinstance(w, str) and "::" in w and w.split("::", 1)[0] not in _RELATIVE_ROOTS:
+        return w.lstrip(":")
+    return None
+
+
+def convert_type(t, c=None) -> tuple:
+    """rustdoc JSON `Type` -> the generator's type AST tuple (see the block comment above). `c` is the Crate the JSON came from: it lets a
+    path node carry its full path (`PathTy.full`, from `c.paths`); without it only a path written with `::` does.
+
+    resolved_path -> ('path', last segment, args) (a `PathTy`)   primitive -> ('prim', n)   tuple [] -> ('unit',), else ('tuple', ..)
+    slice -> ('slice', t)   array -> ('array', t, len text)   borrowed_ref immutable -> ('ref', t), mutable -> ('other', '&mut T')
+    impl_trait / dyn_trait -> ('impl', text) (an ImplTy: `.fn` = FnSig for an `Fn*(..) -> T` bound)   generic / Self / qualified_path / function_pointer / raw_pointer /
     infer / pat -> ('other', text). Never raises on an unknown variant: it comes back as ('other', '<variant>')."""
     if isinstance(t, dict):
         if "__text__" in t:
@@ -464,18 +551,23 @@ def convert_type(t) -> tuple:
             if k == "primitive" and isinstance(v, str):
                 return ("prim", v)
             if k == "resolved_path" and isinstance(v, dict):
-                return ("path", _last_seg(v.get("path") or ""), [convert_type(a) for a in _generic_args(v.get("args"))])
+                node = PathTy(("path", _last_seg(v.get("path") or ""), [convert_type(a, c) for a in _generic_args(v.get("args"))]))
+                node.full = _full_path(v, c)
+                return node
             if k == "tuple" and isinstance(v, list):
-                return ("tuple", [convert_type(a) for a in v]) if v else ("unit",)
-            if k in ("slice", "array"):
-                inner = v if k == "slice" else (v or {}).get("type")
-                return ("slice", convert_type(inner))
+                return ("tuple", [convert_type(a, c) for a in v]) if v else ("unit",)
+            if k == "slice":
+                return ("slice", convert_type(v, c))
+            if k == "array" and isinstance(v, dict):
+                return ("array", convert_type(v.get("type"), c), str(v.get("len")).strip())
+            if k == "array":
+                return ("array", convert_type(None, c), "")
             if k == "borrowed_ref" and isinstance(v, dict):
                 if v.get("is_mutable"):
                     return ("other", render_type(t))
-                return ("ref", convert_type(v.get("type")))
+                return ("ref", convert_type(v.get("type"), c))
             if k in ("impl_trait", "dyn_trait"):
-                return ("impl", render_type(t))
+                return _impl_node(t, k, v, c)
             return ("other", render_type(t))
     return ("other", render_type(t))
 

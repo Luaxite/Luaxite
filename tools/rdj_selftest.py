@@ -294,7 +294,10 @@ def test_convert_type_unit_cases():
     assert rdj.convert_type({"tuple": []}) == ("unit",)
     assert rdj.convert_type({"tuple": [P, P]}) == ("tuple", [("prim", "u32")] * 2)
     assert rdj.convert_type({"slice": P}) == ("slice", ("prim", "u32"))
-    assert rdj.convert_type({"array": {"type": P, "len": "4"}}) == ("slice", ("prim", "u32"))
+    # slice 16: an array keeps its length text (it was ("slice", t) before, which lost N)
+    assert rdj.convert_type({"array": {"type": P, "len": "4"}}) == ("array", ("prim", "u32"), "4")
+    assert rdj.convert_type({"array": {"type": P, "len": "N * 2"}}) == ("array", ("prim", "u32"), "N * 2")
+    assert rdj.convert_type({"array": None})[0] == "array"
     assert rdj.convert_type(path("std::collections::HashMap", path("String"), path("Vec3"))) == \
         ("path", "HashMap", [("path", "String", []), ("path", "Vec3", [])])
     ref = lambda t, m=False, lt=None: {"borrowed_ref": {"lifetime": lt, "is_mutable": m, "type": t}}
@@ -317,7 +320,7 @@ def test_convert_type_unit_cases():
                     ({"brand_new_variant": 1}, "<brand_new_variant>")):
         assert rdj.convert_type(t) == ("other", text), (t, rdj.convert_type(t))
     for bad in (None, 3, "x", [], {}, {"resolved_path": 5}, {"borrowed_ref": None}, {"a": 1, "b": 2}):
-        assert rdj.convert_type(bad)[0] in ("other", "path", "ref", "slice", "tuple", "unit", "prim", "impl"), bad
+        assert rdj.convert_type(bad)[0] in ("other", "path", "ref", "slice", "array", "tuple", "unit", "prim", "impl"), bad
     it = {"resolved_path": {"path": "Iterator", "id": 6, "args": {"angle_bracketed": {"args": [], "constraints": [
         {"name": "Item", "args": None, "binding": {"equality": {"type": P}}}]}}}}
     assert rdj.convert_type(it) == ("path", "Iterator", [("other", "Item = u32")])
@@ -1388,7 +1391,7 @@ def test_config_toml_schema_errors():
     base = (ROOT / "bindgen.toml").read_text()
     cfg = g.load_config()
     assert sorted(cfg) == sorted(["DENY_METHODS", "PATH_OVERRIDES", "RENAMES", "HANDWRITTEN_GOALS", "CLASSES", "EVENT_ARG_NAMES",
-                                  "HIDDEN_EVENTS", "GOAL_PARAM_NAMES", "SCALAR", "RECORDS", "ACCESSORS", "EXTRA_EVENTS", "EXTRA_EVENT_PAYLOADS", "OPTION_STRUCTS", "HAND_CLASSES", "HAND_GLOBALS"])
+                                  "HIDDEN_EVENTS", "GOAL_PARAM_NAMES", "SCALAR", "RECORDS", "ACCESSORS", "EXTRA_EVENTS", "EXTRA_EVENT_PAYLOADS", "OPTION_STRUCTS", "PATH_PREFER", "LOCK_TYPES", "SERDE", "HANDLES", "STATICS", "MONOMORPHISE", "PROPERTIES", "CALLBACKS", "HAND_CLASSES", "HAND_GLOBALS"])
     assert cfg["CLASSES"]["Client"]["renames"] is cfg["RENAMES"] and list(cfg["CLASSES"]) == ["Client", "EntityRef"]
     assert all(isinstance(r, tuple) and len(r) == 3 for rows in cfg["RECORDS"].values() for r in rows)
     d = Path(tmpdir())
@@ -1435,6 +1438,17 @@ def test_config_toml_schema_errors():
     bad(base.replace("deny_methods = []", ""), "missing key `deny_methods`")
     bad(base + "\n[[", "not valid TOML")
     bad(base.replace('doc = "The `bot` global', 'docs = "The `bot` global', 1), "classes.Client.docs", "unknown")
+    # slice 19: optional [lock_types] (which lock `Mutex` / `RwLock` is; empty = such types stay skipped); bindgen.toml holds it empty
+    assert "\n[lock_types]\n" in base and cfg["LOCK_TYPES"] == {}
+    locks = lambda body: base.replace("[lock_types]\n", "[lock_types]\n" + body)
+    (d / "c.toml").write_text(locks('Mutex = "std"\nRwLock = "parking_lot"\n'))
+    assert g.load_config(d / "c.toml")["LOCK_TYPES"] == {"Mutex": "std", "RwLock": "parking_lot"}
+    bad(locks('Mutex = "tokio"\n'), "lock_types.Mutex", "must be \"std\" or \"parking_lot\"", "tokio")
+    bad(locks('Condvar = "std"\n'), "lock_types.Condvar", "unknown", "Mutex, RwLock")
+    bad(locks("Mutex = true\n"), "lock_types.Mutex", "expected str")
+    bad("lock_types = 3\n" + base.replace("[lock_types]\n", ""), "lock_types", "expected dict")
+    (d / "c.toml").write_text(base.replace("[lock_types]\n", ""))
+    assert g.load_config(d / "c.toml")["LOCK_TYPES"] == {}   # the table is optional
     try:
         g.load_config(d / "nope.toml")
     except g.ConfigError as e:
@@ -1649,6 +1663,341 @@ def test_format_61_shapes():
         return ri._variants(C(), {"variants": [3, 4]})
     assert [v["types"] for v in variant(False)] == [[], [("prim", "u8")]]
     assert [v["types"] for v in variant(True)] == [[], [("prim", "u8"), ("other", "_")]]
+
+
+@test
+def test_implements_on_synthetic_impls():
+    """RdjIndex.implements (slice 11): derived and written impl headers, `impl !Trait`, unknown types, blanket impls, two traits of
+    one name, a header whose trait the JSON does not list, the legacy sets, and is_clone/is_display/is_default built on it."""
+    import rdj_index as ri
+    s = Synth("t")
+    clone_t = s.foreign("core", "clone", "Clone", kind="trait")
+    disp_t = s.foreign("core", "fmt", "Display", kind="trait")
+    send_t = s.foreign("core", "marker", "Send", kind="trait")
+    err_t = s.foreign("thiserror", "Error", kind="trait")
+    my = s.mod("my", s.root)
+    mine = s.trait_("Display", my)
+    sid = {n: s.struct(n, s.root, fields=[]) for n in ("Derived", "Written", "Neg", "Mine", "Unlisted", "Other", "Blanket", "Plain", "Bare", "Err", "Both")}
+
+    def tp(name):
+        return Synth.path_type(name, sid[name])
+
+    def put(name, trait, attrs=None, negative=False, target=None, fid=None):
+        iid = s.impl_(target or tp(name), trait)
+        s.index[iid]["inner"]["impl"]["is_negative"] = negative
+        s.index[iid]["attrs"] = attrs or []
+        s.index[sid[name]]["inner"]["struct"]["impls"].append(iid)
+        return iid
+    put("Derived", ("Clone", clone_t), attrs=["automatically_derived"])
+    put("Written", ("fmt::Display", disp_t))
+    put("Neg", ("Send", send_t), negative=True)
+    put("Mine", ("my::Display", mine))
+    put("Unlisted", ("fmt::Display", 9990))      # id not in `paths`: only the written path is known
+    put("Other", ("my::Display", 9991))          # unknown id, written path of another trait
+    put("Bare", ("Display", 9992))
+    put("Err", ("Error", err_t), attrs=["automatically_derived"])
+    put("Both", ("Clone", clone_t))
+    put("Both", ("fmt::Display", disp_t))
+    blanket = s.impl_({"generic": "T"}, ("Clone", clone_t))   # impl<T> Clone for T: target is no named type
+    r = rdj.Rdj()
+    r.crates["t"] = s.crate()
+    ix = ri.RdjIndex(ROOT, ROOT)
+    ix.rdj = r
+    ix.defs = ri.build_defs(r)
+    impls = ri.build_impls(r, classes=set())
+    ix.impl_facts, ix.clone_impls, ix.display_impls, ix.default_impls = impls.facts, impls.clone_impls, impls.display_impls, impls.default_impls
+    C, D, SEND = "core::clone::Clone", "core::fmt::Display", "core::marker::Send"
+    assert ix.implements("Derived", C) is True and ix.implements("Derived", D) is False        # derive(Clone) -> True
+    assert ix.implements("Written", D) is True and ix.implements("Written", "std::fmt::Display") is True  # std == core
+    assert ix.implements("Written", "Display") is True and ix.implements("Written", "Clone") is False   # bare name
+    assert ix.implements("Neg", SEND) is False and ix.implements("Neg", C) is False                   # impl !Send
+    assert ix.implements("NoSuchType", C) is None and ix.implements("String", D) is None            # no definition
+    assert ix.implements("Plain", C) is False and "Plain" not in ix.impl_facts                        # defined, no impl
+    assert ix.implements("Blanket", C) is False and all("T" not in v for v in ix.impl_facts)          # blanket impl not counted
+    assert ix.implements("Mine", D) is False and ix.implements("Mine", "t::my::Display") is True   # `my::Display` != Display
+    assert ix.implements("Unlisted", D) is True and ix.implements("Other", D) is False              # unlisted: written path decides
+    assert ix.implements("Other", "t::my::Display") is True and ix.implements("Bare", D) is True   # bare written + unknown id
+    assert ix.implements("Both", C) is True and ix.implements("Both", D) is True
+    assert [ix.is_clone(n) for n in ("Derived", "Written", "NoSuchType")] == [True, False, None]
+    assert [ix.is_display(n) for n in ("Written", "Mine", "NoSuchType")] == [True, False, None]
+    assert [ix.is_default(n) for n in ("Derived", "NoSuchType")] == [False, None]
+    assert ix.is_display("Err") is True and ix.implements("Err", D) is False                         # derive(Error) writes a Display: rule kept in is_display
+    ix.default_impls.add("Plain")                                                                      # legacy set still counts
+    assert ix.is_default("Plain") is True and ix.implements("Plain", "core::default::Default") is True
+    ix.defs["Plain"][0].attrs.append("#[derive(Default, Hash)]")
+    ix.default_impls.discard("Plain")
+    assert ix.is_default("Plain") is True and ix.implements("Plain", "Hash") is True              # derive on a type without impl headers
+    assert ix.implements("Plain", "my::Hash") is True                                               # (derive names are bare: documented)
+
+
+@test
+def test_implements_keeps_flags_of_the_fake():
+    """is_clone/is_display/is_default over every type of the fake azalea (slice 11 rebuilt them on implements): same results as before."""
+    import collections
+    import rdj_index as ri
+    ix = ri.RdjIndex(FAKE_CRATE.parent, FAKE_CRATE.parent / "rustdoc")
+    ix.load()
+    got = collections.Counter((ix.is_clone(n), ix.is_display(n), ix.is_default(n)) for n in ix.defs)
+    assert got == {(True, False, False): 32, (False, False, False): 14, (True, False, True): 14, (True, True, False): 5, (False, True, False): 1}, got
+    assert (ix.is_clone("NoSuchType"), ix.is_display("NoSuchType"), ix.is_default("NoSuchType")) == (None, None, None)
+    assert ix.implements("Client", "core::clone::Clone") is ix.is_clone("Client") and ix.implements("Client", "Send") is False
+
+
+@test
+def test_implementors_on_synthetic_impls():
+    """RdjIndex.implementors (slice 12): source order of the impl items, no duplicates, derive counted, blanket / negative /
+    `my::Display` not listed, generic types only on request, an empty trait gives [], and the list agrees with implements()."""
+    import rdj_index as ri
+    s = Synth("t")
+    clone_t = s.foreign("core", "clone", "Clone", kind="trait")
+    disp_t = s.foreign("core", "fmt", "Display", kind="trait")
+    send_t = s.foreign("core", "marker", "Send", kind="trait")
+    my = s.mod("my", s.root)
+    mine = s.trait_("Display", my)
+    names = ("Late", "Early", "Twice", "Derived", "Neg", "Mine", "Gen", "Plain", "Tie")
+    sid = {n: s.struct(n, s.root, fields=[]) for n in names}
+    s.index[sid["Gen"]]["inner"]["struct"]["generics"] = s.generics([s.ty_param("T")])
+
+    def put(name, trait, line, col=1, attrs=None, negative=False, target=None, file="azalea/src/lib.rs", generics=None):
+        iid = s.impl_(target or Synth.path_type(name, sid[name]), trait, span=None if line is None else Synth.span(line, col, file=file), generics=generics)
+        s.index[iid]["inner"]["impl"]["is_negative"] = negative
+        s.index[iid]["attrs"] = attrs or []
+        s.index[sid[name]]["inner"]["struct"]["impls"].append(iid)
+        return iid
+    put("Late", ("fmt::Display", disp_t), 90)                              # declared first in the JSON, later in the source
+    put("Early", ("fmt::Display", disp_t), 10)
+    put("Twice", ("fmt::Display", disp_t), 50)
+    put("Twice", ("Display", disp_t), 30)                                  # second header of one type: one entry, earliest position
+    put("Derived", ("Clone", clone_t), 5, attrs=["automatically_derived"])
+    put("Neg", ("Send", send_t), 20, negative=True)
+    put("Mine", ("my::Display", mine), 15)                                 # another trait named Display
+    put("Gen", ("fmt::Display", disp_t), 40)
+    put("Tie", ("fmt::Display", disp_t), 70, col=9)
+    put("Tie", ("fmt::Display", disp_t), 70, col=2)                         # same line: column decides
+    s.impl_({"generic": "T"}, ("Clone", clone_t), span=Synth.span(1))      # blanket impl: no named target
+    vec = s.foreign("alloc", "vec", "Vec")
+    s.impl_(Synth.path_type("Vec", vec), ("fmt::Display", disp_t), span=Synth.span(60), generics=s.generics([s.ty_param("T")]))   # impl<T> .. for Vec<T>
+    r = rdj.Rdj()
+    r.crates["t"] = s.crate()
+    ix = ri.RdjIndex(ROOT, ROOT)
+    ix.rdj = r
+    ix.defs = ri.build_defs(r)
+    impls = ri.build_impls(r, classes=set())
+    ix.impl_facts, ix.clone_impls, ix.display_impls, ix.default_impls = impls.facts, impls.clone_impls, impls.display_impls, impls.default_impls
+    D, C = "core::fmt::Display", "core::clone::Clone"
+    assert ix.implementors(D) == ["Early", "Twice", "Tie", "Late"], ix.implementors(D)    # lines 10, 30, 70 (col 2), 90; Gen and Vec are generic
+    assert ix.implementors(D, include_generic=True) == ["Early", "Twice", "Gen", "Vec", "Tie", "Late"], ix.implementors(D, include_generic=True)
+    assert ix.implementors("Display") == ["Early", "Mine", "Twice", "Tie", "Late"], ix.implementors("Display")   # a bare name matches the last segment: `my::Display` too (lines 10, 15, 30, 70, 90)
+    assert ix.implementors("std::fmt::Display") == ix.implementors(D)                        # std == core
+    assert ix.implementors("t::my::Display") == ["Mine"] and "Mine" not in ix.implementors(D)  # two traits of one name are not conflated
+    assert ix.implementors(C) == ["Derived"]                                                 # derived impl header counts, the blanket impl does not
+    assert ix.implementors("core::marker::Send") == [] and ix.implements("Neg", "core::marker::Send") is False   # impl !Send is no implementor
+    assert ix.implementors("") == [] and ix.implementors("::") == [] and ix.implementors("core::no::Such") == []
+    assert len(ix.implementors(D, True)) == len(set(ix.implementors(D, True)))               # no duplicates
+    for n in ix.implementors(D, True):                                                       # same match as implements()
+        assert ix.implements(n, D) is True
+    assert ix.implementors(D) == ix.implementors(D)                                          # deterministic
+    ix.defs["Plain"][0].attrs.append("#[derive(Default, Hash)]")                              # derive on a type without impl headers
+    assert ix.implementors("Hash") == ["Plain"] and ix.implementors("Default") == ["Plain"]
+    ix.default_impls.add("Late")                                                              # legacy set: after the header-ordered types
+    assert ix.implementors("Default") == ["Late", "Plain"], ix.implementors("Default")
+
+
+@test
+def test_implementors_on_the_fake():
+    """implementors() over the fake azalea (slice 12): agrees with is_clone/is_display/is_default, only non-generic types by default."""
+    import rdj_index as ri
+    ix = ri.RdjIndex(FAKE_CRATE.parent, FAKE_CRATE.parent / "rustdoc")
+    ix.load()
+    for trait, flag in (("core::clone::Clone", ix.is_clone), ("core::fmt::Display", ix.is_display), ("core::default::Default", ix.is_default)):
+        got = ix.implementors(trait, include_generic=True)
+        assert len(got) == len(set(got)), trait
+        assert set(got) == {n for n in ix.defs if flag(n) is True}, trait   # exactly the types the flag says True for
+        plain = ix.implementors(trait)
+        assert set(plain) <= set(got) and not any(d.generics for n in plain for d in ix.defs.get(n, ())), trait
+    assert [len(ix.implementors(t, True)) for t in ("core::clone::Clone", "core::fmt::Display", "core::default::Default")] == [51, 6, 14]
+    assert len(ix.implementors("core::clone::Clone")) == 50 and ix.implementors("") == []
+
+
+@test
+def test_path_nodes_carry_their_full_path():
+    """convert_type(t, c) keeps the full path of a resolved_path node (PathTy.full): from c.paths[id] (crate name first, also for crates that
+    are not loaded), else from a path written with `::`, else None. The node is still the plain ('path', name, args) tuple to every
+    comparison, so no existing `== ("path", "Duration", [])` changes."""
+    from types import SimpleNamespace
+    c = SimpleNamespace(paths={1: {"crate_id": 2, "path": ["core", "time", "Duration"], "kind": "struct"},
+                               2: {"crate_id": 9, "path": ["chrono", "oldtime", "Duration"], "kind": "struct"},
+                               3: {"crate_id": 3, "path": ["alloc", "vec", "Vec"], "kind": "struct"},
+                               4: {"crate_id": 0, "path": [], "kind": "struct"},
+                               5: {"crate_id": 0, "path": ["a", 7], "kind": "struct"}})
+    node = lambda path, i, *args: {"resolved_path": {"path": path, "id": i, "args": {"angle_bracketed": {"args": [{"type": a} for a in args], "constraints": []}} if args else None}}
+    full = lambda t, c=c: getattr(rdj.convert_type(t, c), "full", "NOATTR")
+    assert full(node("Duration", 1)) == "core::time::Duration"          # the summary wins over the written (imported) name
+    assert full(node("Duration", 2)) == "chrono::oldtime::Duration"     # an unloaded crate: the path still says where it lives
+    assert full(node("std::time::Duration", 1)) == "core::time::Duration"
+    assert full(node("Duration", 9)) is None                            # no summary, bare written path: unknown
+    assert full(node("chrono::Duration", 9)) == "chrono::Duration"      # no summary, written with a crate
+    assert full(node("::std::time::Duration", 9)) == "std::time::Duration"
+    for rel in ("crate::Duration", "self::time::Duration", "super::Duration", "$crate::fmt::Result"):
+        assert full(node(rel, 9)) is None, rel                          # relative: says nothing about the home crate
+    assert full(node("Duration", 4)) is None and full(node("Duration", 5)) is None   # junk summary: fall back to the written path
+    assert full(node("x::Duration", 4)) == "x::Duration"
+    assert full(node("Duration", None)) is None and full(node("Duration", "1")) is None
+    assert getattr(rdj.convert_type(node("Duration", 1)), "full", "NOATTR") is None  # no crate given: bare written path = unknown
+    t = rdj.convert_type(node("Vec", 3, node("Duration", 2)), c)
+    assert t.full == "alloc::vec::Vec" and t[2][0].full == "chrono::oldtime::Duration"   # every nested node has its own path
+    r = rdj.convert_type({"borrowed_ref": {"lifetime": None, "is_mutable": False, "type": node("Duration", 1)}}, c)
+    assert r[0] == "ref" and r[1].full == "core::time::Duration"
+    assert rdj.convert_type({"tuple": [node("Duration", 2)]}, c)[1][0].full == "chrono::oldtime::Duration"
+    # still the 3-tuple: equality, unpacking, indexing
+    d = rdj.convert_type(node("Duration", 2), c)
+    assert d == ("path", "Duration", []) and ("path", "Duration", []) == d and d != ("path", "Duration", [("prim", "u8")])
+    assert isinstance(d, tuple) and len(d) == 3 and d[1] == "Duration" and d[2] == [] and d[0] == "path"
+    k, name, args = d
+    assert (k, name, args) == ("path", "Duration", [])
+    assert [d] == [("path", "Duration", [])] and ("path", "Duration", []) in [d]
+
+
+@test
+def test_fake_nodes_know_where_their_types_live():
+    """Over the fake azalea every path node of a method / field has a full path, and the same name `RwLock` is told apart by it: the
+    crate's own stand-in (`azalea::RwLock`) and std's."""
+    import rdj_index as ri
+    ix = ri.RdjIndex(FAKE_CRATE.parent, FAKE_CRATE.parent / "rustdoc")
+    ix.load()
+    seen = set()
+
+    def walk(t):
+        if t[0] == "path":
+            seen.add((t[1], getattr(t, "full", "NOATTR")))
+            for a in t[2]:
+                walk(a)
+        elif t[0] in ("ref", "slice", "array"):
+            walk(t[1])
+        elif t[0] == "tuple":
+            for a in t[1]:
+                walk(a)
+    for m in ix.methods:
+        for _, p in m.params:
+            walk(p)
+        if m.ret:
+            walk(m.ret)
+    for ds in ix.defs.values():
+        for d in ds:
+            for f in d.fields:
+                walk(f[1])
+    assert seen and all(f is not None and f != "NOATTR" for _, f in seen), sorted(x for x in seen if x[1] in (None, "NOATTR"))
+    roots = lambda n: {f.split("::", 1)[0] for nm, f in seen if nm == n}
+    assert roots("RwLock") == {"azalea", "std"}, roots("RwLock")
+    assert roots("Option") == {"core"} and roots("String") == {"alloc"} and roots("Vec") == {"alloc"} and roots("Arc") == {"alloc"}
+    assert roots("Uuid") == {"azalea"}
+
+
+def synth_paths(build):
+    """RdjPaths over one synthetic crate `azalea` built by `build(a)`; returns (paths, build's result)."""
+    import rdj_index
+    from rdj_synth import Synth
+    a = Synth("azalea")
+    ids = build(a)
+    r = rdj.Rdj()
+    r.crates["azalea"] = a.crate()
+    return rdj_index.RdjPaths(r), ids
+
+
+@test
+def test_unique_def_counts_only_reachable_definitions():
+    """s15: a same-name pub struct in a private module no longer blocks the resolution; two reachable ones stay ambiguous, listed."""
+    def one_private(a):
+        meta = a.mod("metadata", a.root)
+        inner = a.mod("inner", a.root, vis="default")
+        a.struct("Chest", meta)
+        a.struct("Chest", inner)
+    pa, _ = synth_paths(one_private)
+    d = pa.unique_def("Chest")
+    assert d is not None and d.modpath == ("metadata",) and pa.ambiguous == {}, (d, pa.ambiguous)
+    assert pa.resolve_path("Chest") == "azalea::metadata::Chest"
+
+    def both(a):
+        for m in ("b", "a"):
+            a.struct("Chest", a.mod(m, a.root))
+    pa, _ = synth_paths(both)
+    assert pa.unique_def("Chest") is None and pa.resolve_path("Chest") is None
+    assert pa.ambiguous == {"Chest": ["azalea::a::Chest", "azalea::b::Chest"]}, pa.ambiguous
+
+    def lone(a):                       # one pub def nobody reaches: still returned (the miss is then `no_path`, as before)
+        a.struct("Lost", a.mod("inner", a.root, vis="default"))
+    pa, _ = synth_paths(lone)
+    assert pa.unique_def("Lost") is not None and pa.resolve_path("Lost") is None and pa.ambiguous == {}
+    assert pa.unique_def("Nope") is None
+
+
+@test
+def test_unique_def_keeps_defs_the_json_does_not_know():
+    """A hand-built def (not an item of the loaded JSON) can't be shown unreachable: it stays a candidate."""
+    g = generator()
+    def build(a):
+        a.struct("Twin", a.mod("inner", a.root, vis="default"))
+        a.struct("Twin", a.mod("open", a.root))
+    pa, _ = synth_paths(build)
+    hand = g.Def(kind="struct", name="Twin", crate="azalea", modpath=("hand",), is_pub=True, generics=False, src=b"")
+    pa.defs["Twin"].append(hand)
+    d = pa.unique_def("Twin")
+    assert d is None and pa.ambiguous["Twin"] == ["azalea::hand::Twin", "azalea::open::Twin"], pa.ambiguous
+
+
+@test
+def test_resolve_path_prefer_picks_among_same_name_types():
+    def both(a):
+        for m in ("metadata", "block"):
+            a.struct("Chest", a.mod(m, a.root))
+        deep = a.mod("deep", a.mod("block", a.root))
+        a.struct("Chest", deep)        # azalea::block::deep::Chest: a third reachable Chest
+    pa, _ = synth_paths(both)
+    assert pa.resolve_path("Chest") is None
+    assert pa.resolve_path("Chest", "azalea::metadata") == "azalea::metadata::Chest"
+    assert pa.resolve_path("Chest", "azalea::block") is None                    # two defs under it
+    assert pa.resolve_path("Chest", "azalea::block::deep") == "azalea::block::deep::Chest"
+    assert pa.resolve_path("Chest", "azalea::meta") is None                     # cut at a `::` boundary, not mid-segment
+    assert pa.resolve_path("Chest", "azalea::nothing") is None and pa.resolve_path("Chest", "azalea::metadata::Chest") == "azalea::metadata::Chest"
+    assert pa.resolve_path("Chest", "") is None                                 # empty prefer = no prefer
+    assert pa.resolve_path("Nope", "azalea") is None
+
+
+@test
+def test_missing_crates_names_unloaded_defining_crates():
+    import rdj_index
+    from rdj_synth import Synth
+    a = Synth("azalea")
+    a.foreign("ecolor", "Color32")
+    a.foreign("ecolor", "hex", "Hex")
+    a.foreign("std", "string", "String")
+    a.foreign("core", "option", "Option", kind="enum")
+    a.foreign("alloc", "vec", "Vec")
+    a.foreign("proc_macro", "TokenStream")
+    a.foreign("tokio", "sync", "Mutex")
+    a.foreign("serde", "ser", "Serialize", kind="trait")
+    a.foreign("gimli", "Reader")
+    a.ext[next(k for k, v in a.ext.items() if v["name"] == "gimli")]["html_root_url"] = "https://doc.rust-lang.org/1.97.0/"
+    a.foreign("somemod", "m", kind="module")                  # a module is not a type
+    r = rdj.Rdj()
+    r.crates["azalea"] = a.crate()
+    pa = rdj_index.RdjPaths(r)
+    assert pa.missing_crates() == ["ecolor", "serde", "tokio"], pa.missing_crates()
+    ec = Synth("ecolor")
+    r.crates["ecolor"] = ec.crate()                           # once loaded it is no longer missing
+    assert rdj_index.RdjPaths(r).missing_crates() == ["serde", "tokio"]
+
+
+@test
+def test_paths_on_the_fake_keep_resolving_and_report_the_missing_crates():
+    import rdj_index as ri
+    ix = ri.RdjIndex(FAKE_CRATE.parent, FAKE_CRATE.parent / "rustdoc")
+    ix.load()
+    assert ix.ambiguous == {} and ix.missing_crates() == ["pin_project_lite", "tokio"], (ix.ambiguous, ix.missing_crates())
+    for n in ("BlockPos", "Client", "ClientboundPlayerCombatKill"):
+        assert ix.resolve_path(n) == ix.resolve_path(n, None) and ix.resolve_path(n) is not None, n
+        assert ix.resolve_path(n, "azalea") == ix.resolve_path(n) and ix.resolve_path(n, "azalea::zzz") is None, n
+    assert ix.ambiguous == {}
 
 
 def main() -> int:

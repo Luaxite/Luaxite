@@ -32,7 +32,13 @@ jobs:
                   RUSTUP_TOOLCHAIN: "1.97.0"
                   SKIP_HARNESS: "1"
                   GOLDEN_STRICT: "1"
-            - name: committed generated files are up to date
+            # slice 29: drift guard. check.sh regenerated harness/src/luau/gen_*.rs and harness/luau/{azalea.d.luau,GEN_REPORT.*} above and compared
+            # them with tools/golden/fake.sha1; this fails when the regenerated files differ from the committed ones (nothing is pushed)
+            - name: committed generated files are up to date (no drift)
+              run: git diff --exit-code -- harness/src/luau harness/luau tools/golden
+            - name: skip histogram of the fake azalea (by code)
+              run: python3 tools/coverage.py --histogram --report harness/luau/GEN_REPORT.json
+            - name: whole tree is clean
               run: git diff --exit-code
 
     luau:

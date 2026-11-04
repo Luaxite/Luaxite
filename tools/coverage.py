@@ -2,7 +2,7 @@
 """Coverage ledger check: every azalea API the generator skips must be classified in tools/coverage.toml.
 
 usage: python3 tools/coverage.py [--report $GEN_REPORT|GEN_REPORT.json] [--dluau types/bindings.d.luau] [--toml tools/coverage.toml]
-                                 [--strict] [--todo [sN]] [--quiet] | --selftest
+                                 [--strict] [--todo [sN]] [--quiet] | --histogram [--report GEN_REPORT.json] | --selftest
 
 Keys = what GEN_REPORT.json lists as not generated: `Client.<fn>` / `EntityRef.<fn>` (Skipped methods), `Goal.<Type>` (Goals not exposed),
 `Event.<Variant>` (Events notes), plus `extra.<name>` for APIs the report cannot see. Status strings (tools/coverage.toml):
@@ -145,6 +145,26 @@ def run(report, dluau, toml_path, strict=False, todo=None, quiet=False):
     return 1 if problems else 0
 
 
+def histogram(data):
+    """Slice 29: GEN_REPORT.json -> [(skip code, count)] most frequent first (ties by code). Reads `skipped_by_code` (slice 13); a report
+    without it is counted from the `code` of every class's skipped rows, so an older report still gives a table."""
+    by = data.get("skipped_by_code")
+    if not isinstance(by, dict):
+        by = {}
+        for cls in data.get("classes") or []:
+            for sk in cls.get("skipped") or []:
+                c = sk.get("code") or "uncoded"
+                by[c] = by.get(c, 0) + 1
+    return sorted(((str(c), int(n)) for c, n in by.items()), key=lambda t: (-t[1], t[0]))
+
+
+def render_histogram(rows):
+    if not rows:
+        return "skipped by code: none"
+    w = max(len(c) for c, _ in rows)
+    return "\n".join(["skipped by code:"] + [f"  {c.ljust(w)}  {n:>4}  {'#' * min(n, 40)}" for c, n in rows] + [f"  {'total'.ljust(w)}  {sum(n for _, n in rows):>4}"])
+
+
 def selftest():
     """Synthetic report/.d.luau/ledger: every check of `run` must fire on its own bad input and stay quiet on the good one."""
     import contextlib
@@ -202,6 +222,10 @@ def selftest():
             except ReportError:
                 continue
             raise AssertionError(f"{name} was accepted")
+    assert histogram({"skipped_by_code": {"b": 2, "a": 2, "z": 5}}) == [("z", 5), ("a", 2), ("b", 2)]
+    assert histogram({"classes": [{"skipped": [{"code": "x"}, {"code": "x"}, {}]}]}) == [("x", 2), ("uncoded", 1)]
+    assert histogram({}) == [] and render_histogram([]) == "skipped by code: none"
+    assert render_histogram([("generic", 4), ("x", 1)]).splitlines()[-1].split() == ["total", "5"]
     print("coverage selftest: OK")
     return 0
 
@@ -209,6 +233,19 @@ def selftest():
 def main(argv):
     if argv == ["--selftest"]:
         return selftest()
+    if "--histogram" in argv:   # slice 29: the table of skip codes of one GEN_REPORT.json (no ledger needed)
+        rest = [x for x in argv if x != "--histogram"]
+        path = os.environ.get("GEN_REPORT", str(ROOT / "GEN_REPORT.json"))
+        if rest[:1] == ["--report"] and len(rest) == 2:
+            path = rest[1]
+        elif rest:
+            sys.exit(__doc__)
+        try:
+            print(render_histogram(histogram(load_report(path))))
+        except ReportError as e:
+            print(f"coverage: {e}", file=sys.stderr)
+            return 2
+        return 0
     a = {"--report": os.environ.get("GEN_REPORT", str(ROOT / "GEN_REPORT.json")), "--dluau": str(ROOT / "types/bindings.d.luau"), "--toml": str(ROOT / "tools/coverage.toml")}
     strict = quiet = False
     todo = None

@@ -1,0 +1,150 @@
+{
+  "schema": 1,
+  "source": {
+    "label": "shapes @ 3d35c91523",
+    "files": 2
+  },
+  "front_end": "rustdoc JSON (rustc 1.97.0 (2d8144b78 2026-07-07), format_version 57)",
+  "classes": [
+    {
+      "name": "Client",
+      "rust": "LuaClient",
+      "luau": "Bot",
+      "emitted": true,
+      "generated": [
+        "apply",
+        "blob",
+        "boxed",
+        "component_hunger",
+        "door",
+        "draw",
+        "draw_all",
+        "each_tick",
+        "elapsed",
+        "for_each",
+        "home",
+        "initial",
+        "later",
+        "load",
+        "locked",
+        "lookup",
+        "name",
+        "note",
+        "open",
+        "open_door",
+        "parse_u32",
+        "pos",
+        "rc_name",
+        "set_pos",
+        "shared",
+        "sum",
+        "tags",
+        "title",
+        "with_opt"
+      ],
+      "properties": [
+        "dist",
+        "pair",
+        "rgb",
+        "volume"
+      ],
+      "async_count": 0,
+      "skipped": [
+        {
+          "name": "make",
+          "sig": "pub fn make(&self) -> impl Fn(u32) -> u32",
+          "origin": "Client (azalea/src/lib.rs)",
+          "reason": "returns `impl Fn(u32) -> u32`"
+        },
+        {
+          "name": "scale",
+          "sig": "pub fn scale(&self, v: &mut f32)",
+          "origin": "Client (azalea/src/lib.rs)",
+          "reason": "mutable reference type `&mut f32` (a `&mut` borrow has no Luau form; handle `&mut self` is s23)"
+        },
+        {
+          "name": "wait_for",
+          "sig": "pub fn wait_for(&self, d: Duration)",
+          "origin": "Client (azalea/src/lib.rs)",
+          "reason": "`wait_for` is hand-written (extra_*.rs) or generated elsewhere"
+        }
+      ]
+    },
+    {
+      "name": "Door",
+      "rust": "LuaDoor",
+      "luau": "Door",
+      "emitted": true,
+      "generated": [
+        "bump",
+        "id"
+      ],
+      "statics": [
+        "new"
+      ],
+      "properties": [
+        "level"
+      ],
+      "async_count": 0,
+      "skipped": []
+    }
+  ],
+  "skipped_by_code": {
+    "excluded": 1,
+    "impl_trait": 1,
+    "reference": 1
+  },
+  "types": {
+    "generated": 2,
+    "builtin": 0
+  },
+  "hand_written": {},
+  "serde_types": {
+    "Blob": "any"
+  },
+  "callbacks": [
+    "() -> ()",
+    "(number) -> boolean",
+    "(number) -> string",
+    "(string) -> ()"
+  ],
+  "events": {
+    "enabled": true,
+    "generated": [
+      {
+        "name": "init",
+        "arg": null,
+        "payload": null
+      },
+      {
+        "name": "tick",
+        "arg": null,
+        "payload": null
+      }
+    ],
+    "hand_fired": [
+      {
+        "name": "update",
+        "packet": null,
+        "why": "Fires on every ECS update (at least once per game tick, usually faster). Only handlers that finish quickly should use it."
+      }
+    ],
+    "not_exposed": []
+  },
+  "packets_out": null,
+  "ecs": null,
+  "packets_in": null,
+  "paths": {
+    "Blob": "azalea::Blob",
+    "Hunger": "azalea::Hunger",
+    "Meters": "azalea::Meters",
+    "Pair": "azalea::Pair",
+    "Shape": "azalea::Shape",
+    "Spec": "azalea::Spec",
+    "Thirst": "azalea::Thirst"
+  },
+  "goals_not_exposed": [],
+  "macros_not_expanded": [],
+  "enum_notes": [],
+  "front_end_skipped": []
+}

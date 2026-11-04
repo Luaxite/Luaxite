@@ -48,6 +48,7 @@ python3 tools/bindgen_selftest.py || bad "tools/bindgen_selftest.py failed"
 
 echo "== coverage ledger (tools/coverage.py)"
 python3 tools/coverage.py --selftest || bad "tools/coverage.py --selftest failed"
+python3 tools/coverage.py --histogram --report harness/luau/GEN_REPORT.json || bad "tools/coverage.py --histogram failed"   # slice 29: skip codes of the fake
 # The real report/d.luau only exist after a build against a bind/azalea-src checkout: GEN_REPORT=<OUT_DIR>/GEN_REPORT.json and types/bindings.d.luau.
 if [ -f "${GEN_REPORT:-/nonexistent}" ] && [ -f types/bindings.d.luau ]; then
     python3 tools/coverage.py || bad "coverage ledger: unclassified or stale rows (see above; fix tools/coverage.toml)"

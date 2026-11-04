@@ -16,6 +16,16 @@ StructureMode = "azalea::protocol::packets::game::s_set_structure_block::Structu
 TestBlockMode = "azalea::protocol::packets::game::s_set_test_block::TestBlockMode"
 Mode = "azalea::protocol::packets::game::s_set_command_block::Mode"
 
+# Same-name types a public path reaches twice: the one under this path prefix wins (type name = path prefix, cut at `::`). Optional;
+# [path_overrides] still wins over it. Empty = no type is steered.
+[path_prefer]
+
+# Which lock `Mutex<T>` / `RwLock<T>` is: "std" (std::sync, a poisoned lock is read anyway) or "parking_lot" (the guard comes straight from `lock()` / `read()`).
+# A configured lock is unwrapped like `Box` / `Rc`: a return is copied out under the guard (`T: Clone`), a `std` lock parameter is built from the Luau value
+# (`parking_lot` parameters stay skipped: the generated code has no such dependency). Optional; unset (the default) = `Mutex<T>` / `RwLock<T>` stay skipped as
+# generic types. A type a loaded crate defines under the same name (azalea's own `RwLock`) is never the std one.
+[lock_types]
+
 # Friendlier Luau names for goal-expanded overloads: the BlockPos goal becomes the default.
 [renames]
 goto_block_pos = "goto"
@@ -176,3 +186,67 @@ getters = [
     ["path", "string", "v.path().to_string()"],
     ["name", "string", "v.to_string()"],
 ]
+
+# Serde types (slice 21): a type that implements serde's `Serialize` (returns) / `Deserialize` (parameters) and that no native shape maps (private
+# fields, ..) is copied through mlua's serde support (`LuaSerde<T>`). mode = "off" (default: nothing changes) | "allow-list" (only `allow`) | "auto";
+# `deny` always wins; `typed` lists structs whose Luau type is spelled from their fields (else `{ [string]: any }` / `any`, a wrong text is worse than
+# `any`); `max_depth` caps typed field nesting. A native shape (table reader, record, enum string) is tried first; serde is the fallback.
+[serde]
+mode = "off"
+
+# Handle classes (slice 22): a type with private fields that a signature mentions becomes a Luau userdata class `Lua<Type>` (field `inner`, its
+# public inherent methods only). mode = "off" (default: nothing changes) | "allow-list" (only `allow`) | "auto"; `deny` always wins; `max` caps the
+# classes made this way. The type must be Clone (it is copied out of a borrow), non-generic, with one definition and a public path; a serde type
+# (see [serde]) stays a value.
+[handles]
+mode = "off"
+allow = []
+deny = []
+max = 64
+
+# Associated fns and `&mut self` (slice 23). An associated fn without a receiver (`Handle::new(n) -> Self`) becomes `Handle.new(n)`: a global
+# table named like the Luau class (`register_globals` in gen_client.rs installs it; call it from the host glue). `Self` means the class.
+# A static whose conversion needs the connected client (an ECS `Entity` / `Client` value) is refused (no `self` to read it from); async and
+# generic fns stay skipped. `mut_self = true` also binds `&mut self` methods of non-bot classes as `fn name(&mut self, ..)` userdata
+# methods: mlua checks the borrow at run time, so a call made while the same userdata is already borrowed raises "already borrowed", and a
+# handle is a copy of the Rust value (a change shows only through that Luau object). mode = "off" (default: nothing changes) | "allow-list"
+# (only `classes`) | "auto"; `deny` = ["Class.fn", ..] always wins.
+[statics]
+mode = "off"
+classes = []
+deny = []
+mut_self = false
+
+# Getter/setter pairs as Luau fields (slice 26). A getter `x(&self) -> T` (no parameters, not async, name not `take` / `take_*` / `set_*`) and a
+# setter `set_x(&mut self | &self, T)` returning `()` or `Result<(), E>` whose parameter has the getter's type become the Luau field `x: T`
+# (`bot.x`, `bot.x = v`) instead of two methods. Both halves must be bound by the generator, else both stay methods. mode = "off" | "allow-list"
+# (the `classes` below) | "auto"; deny = ["Class.x"] (the property name); getter_prefixes = ["get_"] lets `get_x` pair with `set_x`;
+# result_getters = a getter returning `Result` may be a field; readonly_getters = a getter with no setter becomes a read-only field.
+# A `&mut self` setter needs `[statics] mut_self = true` to be bound at all. Default: nothing changes.
+[properties]
+mode = "off"
+classes = []
+deny = []
+getter_prefixes = []
+result_getters = false
+readonly_getters = false
+
+# Generic methods (slice 24). A method with type parameters is bound once per substitution: `rows` = [{ item = "Class.method", T = "i64" }, ..]
+# gives every declared type parameter a primitive or a plain type name (no generic arguments); the wrapper is `<method>_<type>` (types in
+# declaration order, lower snake) and calls `method::<A, B>`. `auto = true` (rows win) binds a method with ONE type parameter that has ONE trait
+# bound and appears in the signature once per implementor of that trait (source order, one per distinct Luau result, at most `max`; types that do
+# not map are dropped). `max` = wrappers per method (default 4). Const parameters and free fns stay skipped. Default: nothing changes.
+[monomorphise]
+rows = []
+max = 4
+auto = false
+
+# Callbacks (slice 25). A parameter `impl Fn(A, B) -> C` (also `FnMut` / `FnOnce`, `Box<dyn Fn..>`, `&dyn Fn..`, inside `Option` / `Vec`) becomes a Luau
+# function `(A, B) -> C`: the wrapper takes an `mlua::Function` and hands Rust a closure that calls it SYNCHRONOUSLY. Arguments are converted like
+# returns, the result like a parameter. A closure cannot raise a Luau error into its Rust caller: a failed call (or a result of the wrong type) is
+# printed by `lua_callback_error` and the closure returns `Default::default()`, so the result type must be `Default` (or `()`). A callback that
+# yields (`task.wait`) fails that way too. Refused: a closure as a return, a `Result` / reference / closure result, a `&mut` argument, more than
+# `max_args` arguments. Default: nothing changes.
+[callbacks]
+mode = "off"
+max_args = 8

@@ -1,12 +1,12 @@
 # tools/coverage.toml - ledger of every azalea API the generator does not bind (checked by tools/coverage.py, see its docstring).
-# Status: `hand <Luau name | Class.name>` | `todo sN <what>` (N = owner slice 2..20 of the PROMPT.md chain) | `no <reason>`.
+# Status: `hand <Luau name | Class.name>` | `todo sN <what>` (N = owner slice of the current PROMPT.md chain: 25 callbacks, 28 fixtures) | `no <reason>`.
 # A slice that binds an API flips its entry to `hand ...`; one that makes the generator emit it deletes the entry (stale otherwise).
 # Rust is not compiled in this chain (PROMPT.md): prefer small hand-written bindings; `sh tools/check.sh` with cargo is the compile check.
 # azalea's #[doc(hidden)] #[deprecated] methods (get_component, try_query_self, try_query_entity) are not in the rustdoc JSON, so the report never
 # lists them and they have no row; the hand bindings of the same names stay (extra_query.rs).
 
 [Client]
-# entity searches with a Luau predicate -> s19
+# entity searches with a Luau predicate (closure params): stay hand until s25 callbacks generates them and s28 has a fixture; then delete the row + hand code
 any_entity_by = "hand any_entity_by"
 any_entity_id_by = "hand any_entity_by"
 nearest_entity_by = "hand nearest_entity_by"
@@ -14,7 +14,7 @@ nearest_entity_id_by = "hand nearest_entity_by"
 nearest_entities = "hand nearest_entities"
 nearest_entities_by = "hand nearest_entities_by"
 nearest_entity_ids_by = "hand nearest_entities_by"
-# components, resources, queries by name -> s18 (name table: s17)
+# components, resources, queries by name (name table + closures): hand; `map_resource` / `query_*` take closures (s25), the by-name tables are not generator work
 component = "hand component"
 entity_component = "hand entity_component"
 get_entity_component = "hand get_entity_component"
@@ -23,22 +23,22 @@ query_entity = "hand query_entity"
 resource = "hand resource"
 map_resource = "hand map_resource"
 map_get_resource = "hand map_get_resource"
-# registries -> s9
+# registries: hand (closure holders `with_registry_holder` / `with_resolved_registry`: s25)
 resolve_registry_key = "hand registry_resolve"
 resolve_registry_name = "hand registry_name"
 with_registry_holder = "hand registry_entries"
 with_resolved_registry = "hand registry_get"
-# raw connection / packets -> s16
+# raw connection / packets: hand (raw packet bytes are glue, closures on `with_raw_connection*`: s25)
 with_raw_connection = "hand raw_connection"
 with_raw_connection_mut = "hand raw_connection_mut"
 write_packet = "hand write_packet"
-# world -> s6
+# world: hand (`world` / `partial_world` return lock guards the s19 lock unwrap does not cover: guards are not copied out)
 world = "hand world"
 partial_world = "hand partial_world"
-# broadcasters -> s5
+# broadcasters: hand (async yield glue, no value to convert)
 get_tick_broadcaster = "hand wait_tick"
 get_update_broadcaster = "hand wait_update"
-# lifecycle -> s11
+# lifecycle: hand (AzaleaLib.join is the entry point, not a Client method)
 join = "hand AzaleaLib.join"
 join_with_proxy = "hand AzaleaLib.join"
 start_client = "hand AzaleaLib.join"

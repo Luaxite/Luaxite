@@ -12,7 +12,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rdj
@@ -56,7 +56,7 @@ def _fields(c: rdj.Crate, ids) -> list:
         if it is None:
             out.append((str(i), ("other", "_"), False))
             continue
-        out.append((it.get("name") or str(i), convert_type(field_type(it)), visibility(it) == "public"))
+        out.append((it.get("name") or str(i), convert_type(field_type(it), c), visibility(it) == "public"))
     return out
 
 
@@ -170,6 +170,54 @@ MACRO_LABEL = "(via macro)"
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+class ImplFact(NamedTuple):
+    """One `impl Trait for T` header: `trait` = canonical path of the trait from the JSON's `paths` (\"core::clone::Clone\", \"\" when the
+    JSON does not list it), `written` = the path as the impl wrote it (\"Clone\", \"fmt::Display\"), `negative` = `impl !Trait for T`,
+    `at` = source position of the impl item (file, line, column, id, crate; () when the item has no span) which gives
+    `implementors` its order, `generic` = the impl has generic parameters (`impl<T> Foo for Vec<T>`)."""
+    trait: str
+    written: str
+    negative: bool
+    at: tuple = ()
+    generic: bool = False
+
+
+# Crates that are one trait namespace seen from different places: std/alloc re-export core, serde re-exports serde_core.
+_TRAIT_CRATE_ALIAS = {"std": "core", "alloc": "core", "serde_core": "serde"}
+
+
+def _trait_segs(path: str) -> list:
+    segs = [x for x in path.strip().split("::") if x]
+    if segs:
+        segs[0] = _TRAIT_CRATE_ALIAS.get(segs[0], segs[0])
+    return segs
+
+
+def trait_matches(fact: ImplFact, trait: str) -> bool:
+    """Does the impl header `fact` implement `trait`? `trait` is a canonical path (\"core::fmt::Display\", std/alloc count as core) or
+    a bare name. A bare name matches the last segment. A path matches the canonical path of the fact when the JSON lists it;
+    when it does not, the written path must agree with `trait` on the segments both have (`fmt::Display` fits `core::fmt::Display`,
+    `my::Display` does not): two traits with one name are not conflated."""
+    t = _trait_segs(trait)
+    if not t:
+        return False
+    if len(t) == 1:
+        return (_trait_segs(fact.trait) or _trait_segs(fact.written) or [""])[-1] == t[0]
+    if fact.trait:
+        return _trait_segs(fact.trait) == t
+    w = _trait_segs(fact.written)
+    n = min(len(w), len(t))
+    return bool(w) and w[-n:] == t[-n:]
+
+
+def _trait_canon(c: rdj.Crate, p: dict) -> str:
+    tr = p.get("trait")
+    if not isinstance(tr, dict) or not isinstance(tr.get("id"), int):
+        return ""
+    path = c.item_path(tr["id"])
+    return "::".join(path) if path else ""
+
+
 @dataclass
 class ImplData:
     """What `RdjIndex` keeps from impls: `methods` (Method per fn of an impl whose target is a bound class), `client_traits`
@@ -180,6 +228,7 @@ class ImplData:
     clone_impls: set = field(default_factory=set)
     display_impls: set = field(default_factory=set)
     default_impls: set = field(default_factory=set)
+    facts: dict = field(default_factory=dict)  # type name -> [ImplFact] of every trait impl header (derived ones too; not synthetic/blanket)
     macro_notes: list = field(default_factory=list)
     hidden: list = field(default_factory=list)
 
@@ -242,6 +291,38 @@ def split_receiver(inputs):
         lt = f"{br['lifetime']} " if br.get("lifetime") else ""
         return f"&{lt}{'mut ' if br.get('is_mutable') else ''}self", rest
     return f"self: {render_type(t)}", rest
+
+
+def type_params_of(fp: dict):
+    """Slice 24: the declared type parameters of a fn payload as [(name, (bound trait last segments,..))] in declaration order, lifetimes dropped,
+    synthetic (`impl Trait`) ones dropped; None when a const parameter exists (no turbofish form is written for it). Bounds come from the
+    parameter itself and from `where T: ..` predicates."""
+    g = fp.get("generics") or {}
+    out, names = [], {}
+    for gp in g.get("params") or []:
+        if not isinstance(gp, dict):
+            continue
+        k = gp.get("kind") or {}
+        if "const" in k:
+            return None
+        ty = k.get("type")
+        if not isinstance(ty, dict) or ty.get("is_synthetic"):
+            continue
+        names[gp.get("name")] = len(out)
+        out.append([gp.get("name"), list(ty.get("bounds") or [])])
+    for wp in g.get("where_predicates") or []:
+        bp = wp.get("bound_predicate") if isinstance(wp, dict) else None
+        if isinstance(bp, dict) and isinstance(bp.get("type"), dict) and bp["type"].get("generic") in names:
+            out[names[bp["type"]["generic"]]][1] += list(bp.get("bounds") or [])
+    res = []
+    for n, bounds in out:
+        tr = []
+        for b in bounds:
+            tb = b.get("trait_bound") if isinstance(b, dict) else None
+            if isinstance(tb, dict) and isinstance(tb.get("trait"), dict):
+                tr.append(rdj._last_seg(tb["trait"].get("path") or ""))
+        res.append((n, tuple(tr)))
+    return res
 
 
 def param_name(name) -> Optional[str]:
@@ -323,6 +404,22 @@ def _is_user_impl(it: dict, p: dict) -> bool:
     return not (p.get("is_synthetic") or p.get("blanket_impl")) and "automatically_derived" not in (it.get("attrs") or [])
 
 
+def _note_fact(data: "ImplData", c: rdj.Crate, it: dict, p: dict) -> None:
+    """Keep the header of a trait impl (derived or written, negative too) in `data.facts`; rustdoc's synthetic/blanket impls and
+    impls on a non-path type are not facts. Never raises: a header that cannot be read is simply not a fact."""
+    try:
+        if p.get("is_synthetic") or p.get("blanket_impl"):
+            return
+        tname, tr = _target_name(p), p.get("trait")
+        if tname and isinstance(tr, dict) and tr.get("path"):
+            fname, begin = _span(it)[0], (_span(it)[1] + (0, 0))[:2]
+            at = (str(fname or "").replace("\\", "/"), begin[0], begin[1], it.get("id") if isinstance(it.get("id"), int) else 0, c.name)
+            data.facts.setdefault(tname, []).append(ImplFact(_trait_canon(c, p), tr["path"], bool(p.get("is_negative")), at,
+                                                             bool((p.get("generics") or {}).get("params"))))
+    except Exception:
+        return
+
+
 def build_impls(r: rdj.Rdj, crates=None, classes=None, strip_prefix: str = "", hidden: str = "keep",
                 skips: Optional[list] = None) -> ImplData:
     """Fill the impl tables (methods, client traits, Goal impls) from the JSON of every loaded crate (or `crates`): one `Method` per fn of
@@ -346,6 +443,7 @@ def build_impls(r: rdj.Rdj, crates=None, classes=None, strip_prefix: str = "", h
                 if k != "impl":
                     continue
                 p = payload(it)
+                _note_fact(data, c, it, p)
                 if not _is_user_impl(it, p):
                     continue
                 tname, trait = _target_name(p), _trait_name(p)
@@ -354,12 +452,12 @@ def build_impls(r: rdj.Rdj, crates=None, classes=None, strip_prefix: str = "", h
                 continue
             if trait == "Goal":
                 data.goal_impls.add(tname)
-            if trait == "Clone":
-                data.clone_impls.add(tname)
-            if trait == "Display":
-                data.display_impls.add(tname)
-            if trait == "Default":
-                data.default_impls.add(tname)
+            if tname and trait in ("Clone", "Display", "Default") and not p.get("is_negative"):   # no `''` for impls on a non-path type
+                fact = ImplFact(_trait_canon(c, p), p["trait"]["path"], False)
+                for std, bucket in (("core::clone::Clone", data.clone_impls), ("core::fmt::Display", data.display_impls),
+                                    ("core::default::Default", data.default_impls)):
+                    if trait_matches(fact, std):  # `my::Display` is not std's Display
+                        bucket.add(tname)
             if tname not in classes:
                 continue
             if trait and tname == "Client":
@@ -392,9 +490,10 @@ def build_impls(r: rdj.Rdj, crates=None, classes=None, strip_prefix: str = "", h
                 generics=any(not ((gp.get("kind") or {}).get("type") or {}).get("is_synthetic")
                              for gp in (fp.get("generics") or {}).get("params") or [] if isinstance(gp, dict)),
                 receiver=recv,
-                params=[(param_name(n), convert_type(t)) for n, t in rest],
-                ret=convert_type(out) if out is not None else None,
-                owner=trait or tname, file=file, sig=fn_sig_text(fn, fp), target=tname))
+                params=[(param_name(n), convert_type(t, c)) for n, t in rest],
+                ret=convert_type(out, c) if out is not None else None,
+                owner=trait or tname, file=file, sig=fn_sig_text(fn, fp), target=tname,
+                type_params=type_params_of(fp)))
         except Exception as e:
             note_skip(skips, c, fn.get("id"), fn, e)
     return data
@@ -428,6 +527,7 @@ class RdjPaths:
         self.reexports: list = []
         self.globs: list = []
         self.unresolved: list = []
+        self.ambiguous: dict = {}   # name -> sorted `crate::mod::Name` of every reachable pub def, when unique_def found several
         self._def_ids: dict = {}
         self._ns: dict = {}
         self._cut = False
@@ -472,9 +572,27 @@ class RdjPaths:
     def chain_public(self, crate, modpath) -> bool:
         return all(self.mod_pub.get((crate, tuple(modpath[:i])), False) for i in range(1, len(modpath) + 1))
 
+    def _reachable(self, d) -> Optional[bool]:
+        """Does a public path from a root crate lead to `d`? None: `d` is not an item of the loaded JSON (a hand-built def), so
+        nothing can be said and it stays a candidate."""
+        ids = [v for k, v in self._def_ids.items() if k[:3] == (d.crate, tuple(d.modpath), d.name)]
+        if not ids:
+            return None
+        pp = self.public_paths()
+        return any(pp.get(i) for i in ids)
+
     def unique_def(self, name: str):
+        """The one public definition called `name`. Several: only those a public path reaches count (a same-name type in a private
+        module no longer blocks the resolution); exactly one left -> it; several left -> None, and `self.ambiguous[name]` lists
+        them (never ranked silently). A single public def is returned as before, reachable or not (its missing path is then
+        `no_path`, not `no_definition`)."""
         pubs = [d for d in self.defs.get(name, []) if d.is_pub]
-        return pubs[0] if len(pubs) == 1 else None
+        if len(pubs) <= 1:
+            return pubs[0] if pubs else None
+        cands = [d for d in pubs if self._reachable(d) is not False]
+        if len(cands) >= 2:
+            self.ambiguous[name] = sorted("::".join((d.crate, *d.modpath, d.name)) for d in cands)
+        return cands[0] if len(cands) == 1 else None
 
     def _resolve(self, c: rdj.Crate, id):
         """(crate name, item id) of a `use` target: a local item, or an item of another crate found by its `paths` entry
@@ -557,11 +675,43 @@ class RdjPaths:
         ps = [p for p in self.paths_of(crate, modpath, name) if p.split("::")[-1] == name]
         return ps[0] if ps else None
 
-    def resolve_path(self, name: str) -> Optional[str]:
-        d = self.unique_def(name)
-        if d is None:
-            return None
-        return self.to_azalea(d.crate, d.modpath, d.name)
+    def resolve_path(self, name: str, prefer: Optional[str] = None) -> Optional[str]:
+        """Canonical `azalea::..` path of the type called `name`. `prefer` (a path prefix such as `azalea::entity::metadata`, cut at
+        a `::` boundary) picks among same-name definitions: those with a public path under it; exactly one such definition ->
+        its shortest path under the prefix, else None. Without `prefer` this is `unique_def` + `to_azalea`."""
+        if not prefer:
+            d = self.unique_def(name)
+            if d is None:
+                return None
+            return self.to_azalea(d.crate, d.modpath, d.name)
+        found = {}
+        for d in self.defs.get(name, []):
+            if not d.is_pub or self._reachable(d) is False:
+                continue
+            ps = [p for p in self.paths_of(d.crate, d.modpath, d.name) if p.split("::")[-1] == name
+                  and (p == prefer or p.startswith(prefer + "::"))]
+            if ps:
+                found[(d.crate, tuple(d.modpath), d.name)] = ps[0]
+        return next(iter(found.values())) if len(found) == 1 else None
+
+    NOT_USER_CRATES = frozenset({"std", "core", "alloc", "proc_macro", "test"})
+
+    def missing_crates(self) -> list:
+        """Sorted names of the crates that define a type (struct, enum, union, trait) some loaded crate's `paths` mentions and that
+        is itself not loaded: load its JSON to follow that type. std, core, alloc, proc_macro and test are never listed, nor the crates std
+        itself is built from (their `html_root_url` is the Rust docs: hashbrown, gimli, libc, ...)."""
+        loaded = set(self.r.crates)
+        out = set()
+        for c in self.r.crates.values():
+            for s in c.paths.values():
+                cid = s.get("crate_id")
+                if not cid or s.get("kind") not in self.DEF_KINDS:
+                    continue
+                name = c.crate_name(cid)
+                root = (c.external_crates.get(cid) or {}).get("html_root_url") or ""
+                if name and name not in loaded and name not in self.NOT_USER_CRATES and "doc.rust-lang.org" not in root:
+                    out.add(name)
+        return sorted(out)
 
 
 
@@ -770,6 +920,28 @@ def event_cfg_gates(r: rdj.Rdj, defs: dict, root: Path, prefix: str = "") -> lis
     return warns
 
 
+SERDE_SHAPE_KEYS = frozenset("rename rename_all rename_all_fields flatten tag content untagged transparent skip skip_serializing skip_deserializing "
+                             "with serialize_with deserialize_with from try_from into variant_identifier field_identifier other".split())
+SERDE_NEUTRAL_KEYS = frozenset({"deny_unknown_fields", "alias", "default", "skip_serializing_if"})
+
+
+def serde_attr_bodies(attr: str) -> list:
+    """The bodies of `serde(..)` in one attribute text (`#[serde(rename_all = "x")]`, or rustdoc's `#[attr = ..]` object text)."""
+    return [m.group(1) for m in re.finditer(r"\bserde\s*\(((?:[^()]|\([^()]*\))*)\)", attr or "")]
+
+
+def serde_shape(attrs) -> str:
+    """\"plain\" (no key), \"optional-keys\" (only neutral keys that may drop a key) or \"any\" (a shape-changing or unknown key). Keys are the
+    idents before `=` / `,` / `(` at the top level of each body; a serialize/deserialize split such as `rename(serialize = ..)` is its key `rename`."""
+    keys = []
+    for body in attrs or ():
+        keys += re.findall(r"(?:^|,)\s*([A-Za-z_]\w*)", re.sub(r'"(?:[^"\\]|\\.)*"|\([^()]*\)|=\s*[^,]*', "", body))
+    if any(k not in SERDE_NEUTRAL_KEYS for k in keys):
+        return "any"
+    return "optional-keys" if any(k in ("default", "skip_serializing_if") for k in keys) else "plain"
+
+
+
 class RdjIndex:
     """The index the generator consumes, filled from rustdoc JSON. Attributes and methods:
     `defs mod_pub reexports methods goal_impls client_traits globs macro_notes files digest crates`, `aliases()
@@ -785,40 +957,100 @@ class RdjIndex:
         self.clone_impls: set = set()
         self.display_impls: set = set()
         self.default_impls: set = set()
+        self.impl_facts: dict = {}
         self.skipped_items: list = []
         self.discovered: dict = {}
         self.discover_skipped: list = []
         self.hidden_fns: list = []
 
-    def is_clone(self, name: str):
-        """True/False from the derived impls (`def_attrs` rebuilds `#[derive(..)]`) and
-        hand-written `impl Clone for T`; None when the type has no definition in the loaded crates (std, other crates)."""
-        if name in self.clone_impls:
+    # trait path -> the legacy name set that tests and callers may still fill by hand
+    _LEGACY_SETS = ((("core", "clone", "Clone"), "clone_impls"), (("core", "fmt", "Display"), "display_impls"),
+                    (("core", "default", "Default"), "default_impls"))
+
+    def implements(self, name: str, trait: str):
+        """True/False/None: does the type `name` implement `trait` (canonical path like \"core::clone::Clone\", or a bare name)?
+        True = a written or derived `impl Trait for T` header (not rustdoc's synthetic/blanket impls) whose trait is `trait` (see
+        `trait_matches`: `fmt::Display` and `my::Display` are not conflated), or a `#[derive(..)]` naming it on a type that has
+        no impl headers loaded, or the name sits in the matching legacy set (`clone_impls` ..). False = the type is defined in the
+        loaded crates and has no such impl, or an explicit `impl !Trait`. None = no definition in the loaded crates (std, other crates)."""
+        facts = [f for f in self.impl_facts.get(name, ()) if trait_matches(f, trait)]
+        if any(f.negative for f in facts):
+            return False
+        if facts:
             return True
+        want = _trait_segs(trait)
+        for segs, attr in self._LEGACY_SETS:
+            if name in getattr(self, attr) and trait_matches(ImplFact("::".join(segs), "", False), trait):
+                return True
         ds = self.defs.get(name)
         if not ds:
             return None
-        return any(re.search(r"\bClone\b", a) for d in ds for a in d.attrs)
+        if name not in self.impl_facts and want:
+            for d in ds:
+                for a in d.attrs:
+                    if a.startswith("#[derive") and want[-1] in IDENT.findall(a[len("#[derive"):]):
+                        return True
+        return False
+
+    def implementors(self, trait: str, include_generic: bool = False) -> list:
+        """Names of the types that implement `trait` (same match as `implements`: True only, so `impl !Trait`, unknown types,
+        rustdoc's synthetic/blanket impls and `my::Display` for `core::fmt::Display` are not listed; a `#[derive(..)]`
+        naming the trait counts). Source order of the impl items (file, line, column, id, crate); a type that is only known
+        through a derive or a legacy name set follows them, in the order of `defs` (crate, module, line). No duplicates.
+        Generic types (a Def with generic parameters; for a type without a Def, an impl with generic parameters) are left
+        out unless `include_generic`. An empty or unusable `trait` -> []. Names, not paths: two types of one name in
+        different crates are one entry. The feeder for generic dispatch (slice 24), like `implements` for the flags."""
+        if not _trait_segs(trait):
+            return []
+        rank = {n: i for i, n in enumerate(self.defs)}
+        names = (set(self.impl_facts) | set(self.defs) | self.clone_impls | self.display_impls | self.default_impls) - {""}
+        found = []
+        for name in names:
+            if self.implements(name, trait) is not True:
+                continue
+            facts = [f for f in self.impl_facts.get(name, ()) if trait_matches(f, trait)]
+            if not include_generic:
+                ds = self.defs.get(name)
+                if any(d.generics for d in ds) if ds else any(f.generic for f in facts):
+                    continue
+            at = sorted(f.at for f in facts if f.at)
+            found.append(((0, at[0], name) if at else (1, (rank.get(name, len(rank)),), name), name))
+        return [n for _, n in sorted(found)]
+
+    def is_serialize(self, name: str):
+        """True/False/None for `serde::ser::Serialize` (see `implements`; derived impls count)."""
+        return self.implements(name, "serde::ser::Serialize")
+
+    def is_deserialize(self, name: str):
+        """True/False/None for `serde::de::Deserialize` (see `implements`; derived impls count)."""
+        return self.implements(name, "serde::de::Deserialize")
+
+    def serde_attrs(self, name: str):
+        """The `serde(..)` attribute bodies visible on the type and its variants (`[]` = none visible, None = no definition). Field
+        attributes are not kept in a `Def`, so `[]` means \"none seen\", not \"none exist\" (the caller treats it as unknown)."""
+        ds = self.defs.get(name)
+        if not ds:
+            return None
+        out = []
+        for d in ds:
+            for a in list(d.attrs or ()) + [x for v in d.variants or () for x in (v.get("attrs") or ())]:
+                out += serde_attr_bodies(a)
+        return out
+
+    def is_clone(self, name: str):
+        """True/False for `Clone` (see `implements`); None when the type has no definition in the loaded crates (std, other crates)."""
+        return self.implements(name, "core::clone::Clone")
 
     def is_display(self, name: str):
-        """True/False like `is_clone`, for `Display` (a written `impl Display for T`, or `#[derive(Error)]` which writes one);
-        None when the type has no definition in the loaded crates."""
-        if name in self.display_impls:
+        """Like `is_clone`, for `Display` (an `impl Display for T`, or `#[derive(Error)]` which writes one)."""
+        r = self.implements(name, "core::fmt::Display")
+        if r is False and any(re.search(r"\bError\b", a) for d in self.defs.get(name) or () for a in d.attrs if a.startswith("#[derive")):
             return True
-        ds = self.defs.get(name)
-        if not ds:
-            return None
-        return any(re.search(r"\bError\b", a) for d in ds for a in d.attrs if a.startswith("#[derive"))
+        return r
 
     def is_default(self, name: str):
-        """True/False like `is_clone`, for `Default` (`#[derive(Default)]` or a written `impl Default for T`); None when the type
-        has no definition in the loaded crates."""
-        if name in self.default_impls:
-            return True
-        ds = self.defs.get(name)
-        if not ds:
-            return None
-        return any(re.search(r"\bDefault\b", a) for d in ds for a in d.attrs if a.startswith("#[derive"))
+        """Like `is_clone`, for `Default` (`#[derive(Default)]` or a written `impl Default for T`)."""
+        return self.implements(name, "core::default::Default")
 
     def load(self):
         need = source_crates(self.root)
@@ -841,14 +1073,18 @@ class RdjIndex:
         for w in event_cfg_gates(self.rdj, self.defs, self.root, prefix):
             self.warn(w)
         cands = self._class_candidates() if not gen.CLASSES else None
-        impls = build_impls(self.rdj, classes=cands, strip_prefix=prefix, hidden=self.hidden, skips=sk)
+        hcands = self.handle_candidates() if (cands is None and getattr(gen, "HANDLES", {}).get("mode", "off") != "off") else set()
+        impls = build_impls(self.rdj, classes=(set(gen.CLASSES) | hcands) if hcands else cands, strip_prefix=prefix, hidden=self.hidden, skips=sk)
         if cands is not None:
             impls.methods = self._keep_discovered(impls.methods) + self._free_fns()
+        elif hcands:   # slice 22: a handle class gets its public inherent methods only (trait impls are not script API), like discovery
+            impls.methods = [m for m in impls.methods if m.target in gen.CLASSES or (m.is_pub and m.owner == m.target)]
         self.methods = impls.methods
         self.goal_impls, self.client_traits, self.macro_notes = impls.goal_impls, impls.client_traits, impls.macro_notes
         self.clone_impls = impls.clone_impls
         self.display_impls = impls.display_impls
         self.default_impls = impls.default_impls
+        self.impl_facts = impls.facts
         self.hidden_fns = impls.hidden
         self.mod_pub, self.reexports, self.globs = self.paths.mod_pub, self.paths.reexports, self.paths.globs
 
@@ -867,6 +1103,20 @@ class RdjIndex:
             elif self.resolve_path(name) is None:
                 self.discover_skipped.append((name, "no public path"))
             else:
+                out.add(name)
+        return out
+
+    def handle_candidates(self) -> set:
+        """Type names that may become a handle class (slice 22): one definition, a non-generic struct with a private field or no field
+        (a type that is not a plain value), a public path. Config (`[handles]`) and `Clone` are judged by the generator's Mapper."""
+        out = set()
+        for name in sorted(self.defs):
+            if len(self.defs[name]) != 1:
+                continue
+            d = self.defs[name][0]
+            if d.kind != "struct" or d.generics or (d.fields and all(f[2] for f in d.fields)):
+                continue
+            if self.resolve_path(name) is not None:
                 out.add(name)
         return out
 
@@ -900,9 +1150,9 @@ class RdjIndex:
                     is_async=bool((fp.get("header") or {}).get("is_async")),
                     generics=any(not ((gp.get("kind") or {}).get("type") or {}).get("is_synthetic")
                                  for gp in (fp.get("generics") or {}).get("params") or [] if isinstance(gp, dict)),
-                    receiver=recv, params=[(param_name(n), convert_type(t)) for n, t in rest],
-                    ret=convert_type(outp) if outp is not None else None,
-                    owner="::".join(path), file="::".join(path), sig=fn_sig_text(fn, fp), target=f"@{path[0]}"))
+                    receiver=recv, params=[(param_name(n), convert_type(t, c)) for n, t in rest],
+                    ret=convert_type(outp, c) if outp is not None else None,
+                    owner="::".join(path), file="::".join(path), sig=fn_sig_text(fn, fp), target=f"@{path[0]}", type_params=type_params_of(fp)))
             except Exception as e:
                 note_skip(self.skipped_items, c, fid, fn, e)
         for t in sorted({m.target for m in out}):
@@ -968,4 +1218,7 @@ class RdjIndex:
     def chain_public(self, crate, modpath): return self._safe(f"chain_public({crate}, {modpath})", False, self.paths.chain_public, crate, modpath)
     def to_azalea(self, crate, modpath, name): return self._safe(f"{crate}::{'::'.join(modpath)}::{name}", None, self.paths.to_azalea, crate, modpath, name)
     def unique_def(self, name): return self._safe(f"unique_def({name})", None, self.paths.unique_def, name)
-    def resolve_path(self, name): return self._safe(f"resolve_path({name})", None, self.paths.resolve_path, name)
+    def resolve_path(self, name, prefer=None): return self._safe(f"resolve_path({name})", None, self.paths.resolve_path, name, prefer)
+    def missing_crates(self): return self._safe("missing_crates()", [], self.paths.missing_crates)
+    @property
+    def ambiguous(self) -> dict: return self.paths.ambiguous

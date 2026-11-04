@@ -974,6 +974,23 @@ impl Client {
         };
         Ok(auto_tool::BestToolResult { index, percentage_per_tick })
     }
+
+    /// Generator fixture for slice 25: a plain `impl Fn(Entity) -> bool` (no type parameters).
+    /// Returns the first entity the predicate accepts, or None.
+    pub fn any_entity_by(&self, predicate: impl Fn(Entity) -> bool) -> Option<Entity> {
+        for id in [7u32, 1, 3, 2, 4] {
+            let e = Entity(id);
+            if predicate(e) {
+                return Some(e);
+            }
+        }
+        None
+    }
+
+    /// Generator fixture for slice 25: `impl Fn(f32) -> f32` (simple scalar round-trip).
+    pub fn map_health(&self, f: impl Fn(f32) -> f32) -> f32 {
+        f(20.0)
+    }
 }
 
 /// Stand-in for bevy's `Component` bound on `Client::component`.
