@@ -1,5 +1,6 @@
+require("./inject")
 
 
 
+m:open()
 
-_G.getgenv = function() return _G end
