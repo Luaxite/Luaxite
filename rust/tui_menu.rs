@@ -27,7 +27,8 @@
 //   m:wait()                 -- yields until the menu is closed (q / Ctrl-C / m:close())
 //   m:close()  m:is_open()
 //   m:tree()                 -- the menu table itself (the one you passed, or what your function returned; it follows `r`)
-//   m:conf()                 -- the options table (the one you passed as 2nd arg, or a new one): `m:conf().title = "x"` retitles the menu at once
+//   m:conf()                 -- the options table (the one you passed as 2nd arg, or a new one): `m:conf().title = "x"` retitles the menu at once;
+//                               `m:conf().log_percent = 40` gives the log list 40% of the screen (default 50, 0 hides it; clamped to 90), also at once
 //
 // Items (`Type` is case-insensitive; field names may be `Name` or `name`, and so on; `Func` may also be spelled `Callback`):
 //   Number / String / Boolean   `Value` is shown and edited in the menu (Enter; a Boolean toggles). The new value is written back into `Value`
@@ -42,6 +43,8 @@
 // The table you pass IS the menu: edits are written into it, and changes your script makes to it show up in the menu at once.
 // `menu.new(function() return tree end)` also works: the function is called when the menu is created and again on `r`.
 //
+// The screen is one box on Luau blue (#00A2FF): the title and the menu path on the top border, the key help on the bottom one.
+// Inside it is split: the menu on top, the log list under it (always shown; `l` / Tab moves the keys between the two, so the log list can be scrolled).
 // While the menu is open it owns the terminal (alternate screen): use `m:log` instead of `print`. Callbacks run in their own Luau thread, so
 // they may yield (`task.wait`, `bot:...`); an error they raise is logged. Keys are listed in the footer of the menu.
 
@@ -53,14 +56,30 @@ use std::time::{Duration, Instant};
 
 use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, Value, Variadic};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 /// Log lines kept; the oldest is dropped first.
 const MAX_LOGS: usize = 1000;
+
+// The look: a box on Luau's brand blue (#00A2FF, the Luau logo). White text is hard to read on this blue, so the text is dark ink and white is kept
+// for the box, the values and the selected row. To restyle, change these. (A terminal without 24-bit color can use `Color::Indexed(39)` for BG.)
+const BG: Color = Color::Rgb(0, 162, 255);
+const INK: Color = Color::Rgb(0, 20, 50); // text
+const DIM: Color = Color::Rgb(0, 55, 105); // secondary text: counts, hints, scroll marks
+const EDGE: Color = Color::White; // the box and the divider
+const VALUE: Color = Color::White; // values (bold)
+const GOOD: Color = Color::Rgb(0, 70, 25); // buttons
+const BAD: Color = Color::Rgb(125, 0, 0); // errors
+const BAR: Color = Color::Rgb(0, 28, 70); // behind the title and the selected row (white text)
+
+/// Share of the screen body the log list gets when the script sets no `log_percent` (the divider row counts as part of it).
+const DEFAULT_LOG_PERCENT: u16 = 50;
+/// The most the log list may take: the menu always keeps something.
+const MAX_LOG_PERCENT: u16 = 90;
 
 /// One terminal, one menu: set while a menu thread owns the screen.
 static TERMINAL_BUSY: AtomicBool = AtomicBool::new(false);
@@ -131,6 +150,16 @@ impl Shared {
             _ => "menu".into(),
         }
     }
+
+    /// The share of the body (0..=90) the log list takes, as the script has it now; 0 hides the list. Not a number: the default.
+    fn log_percent(&self) -> u16 {
+        let percent = match self.conf.get::<Value>("log_percent") {
+            Ok(Value::Integer(i)) => i as f64,
+            Ok(Value::Number(n)) => n,
+            _ => return DEFAULT_LOG_PERCENT,
+        };
+        if percent.is_nan() { DEFAULT_LOG_PERCENT } else { percent.clamp(0.0, MAX_LOG_PERCENT as f64) as u16 }
+    }
 }
 
 struct Menu(Arc<Shared>);
@@ -154,6 +183,9 @@ impl Menu {
         };
         if matches!(conf.get::<Value>("title")?, Value::Nil) {
             conf.set("title", "menu")?;
+        }
+        if matches!(conf.get::<Value>("log_percent")?, Value::Nil) {
+            conf.set("log_percent", DEFAULT_LOG_PERCENT)?;
         }
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| mlua::Error::runtime("menu.new must be called from a running script"))?;
@@ -500,6 +532,7 @@ fn fire_oncalls(sh: &Arc<Shared>, menu: &Table, label: &str) {
 // UI state and keys
 // ---------------------------------------------------------------------------------------------------------------------------------------
 
+/// Which of the two panes has the keys. Both are always drawn (see `split_body`).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Pane {
     #[default]
@@ -538,6 +571,11 @@ struct Snapshot {
 impl Ui {
     /// The menu the UI is in. A path that no longer exists (the script removed it) is cut back to what does.
     fn snapshot(&mut self, sh: &Shared) -> Snapshot {
+        if self.pane == Pane::Logs && sh.log_percent() == 0 {
+            // the script hid the log list while it had the keys
+            self.pane = Pane::Menu;
+            self.log_back = 0;
+        }
         let Some(root) = sh.root() else {
             return Snapshot { title: sh.title(), crumbs: String::new(), entries: Vec::new() };
         };
@@ -581,7 +619,10 @@ impl Ui {
     fn logs_key(&mut self, sh: &Shared, ev: KeyEvent) {
         match ev.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc | KeyCode::Char('l') | KeyCode::Tab => self.pane = Pane::Menu,
+            KeyCode::Esc | KeyCode::Char('l') | KeyCode::Tab => {
+                self.pane = Pane::Menu;
+                self.log_back = 0; // the menu has the keys: the log list follows the newest line again
+            }
             KeyCode::Up | KeyCode::Char('k') => self.log_back += 1,
             KeyCode::Down | KeyCode::Char('j') => self.log_back = self.log_back.saturating_sub(1),
             KeyCode::PageUp => self.log_back += 10,
@@ -606,8 +647,12 @@ impl Ui {
                 }
             }
             KeyCode::Char('l') | KeyCode::Tab => {
-                self.pane = Pane::Logs;
-                self.log_back = 0;
+                if sh.log_percent() == 0 {
+                    self.status = Some("the log list is hidden (conf.log_percent is 0)".into());
+                } else {
+                    self.pane = Pane::Logs;
+                    self.log_back = 0;
+                }
             }
             KeyCode::Char('r') => match sh.load_root() {
                 Ok(_) => sh.log("reloaded"),
@@ -733,51 +778,71 @@ fn fmt_elapsed(d: Duration) -> String {
     format!("{:02}:{:02}", s / 60 % 100, s % 60)
 }
 
+/// The whole screen is one box: the title top left, the path top right, the menu and the log list inside, and at the bottom the key help
+/// (or the value being edited, or the last problem).
 fn draw(f: &mut Frame, ui: &mut Ui, sh: &Shared, snap: &Snapshot) {
-    let [head, body, foot] = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+    let area = f.area();
+    let base = Style::new().fg(INK).bg(BG);
+    let dim = Style::new().fg(DIM);
+    let chip = Style::new().add_modifier(Modifier::BOLD).fg(Color::White).bg(BAR);
 
-    let where_ = match ui.pane {
-        Pane::Menu => snap.crumbs.clone(),
-        Pane::Logs => "logs".to_string(),
-    };
-    f.render_widget(
-        Line::from(vec![
-            Span::styled(format!(" {} ", snap.title), Style::new().add_modifier(Modifier::BOLD).fg(Color::Black).bg(Color::Cyan)),
-            Span::raw(format!(" {where_}")),
-        ]),
-        head,
-    );
-
-    match ui.pane {
-        Pane::Menu => draw_menu(f, ui, snap, body),
-        Pane::Logs => draw_logs(f, ui, sh, body),
-    }
-
-    let dim = Style::new().fg(Color::DarkGray);
-    if let Some(edit) = &ui.edit {
+    let mut cursor = None;
+    let bottom = if let Some(edit) = &ui.edit {
         let prefix = format!(" {} = ", edit.label);
         let text: String = edit.buf.iter().collect();
-        f.render_widget(Line::from(vec![Span::styled(prefix.clone(), dim), Span::raw(text)]), foot);
-        let x = foot.x + (prefix.chars().count() + edit.pos) as u16;
-        f.set_cursor_position(Position::new(x.min(foot.right().saturating_sub(1)), foot.y));
+        cursor = Some(area.x + 1 + (prefix.chars().count() + edit.pos) as u16); // just right of the corner
+        Line::from(vec![Span::styled(prefix, dim), Span::styled(format!("{text} "), Style::new().add_modifier(Modifier::BOLD))])
     } else if let Some(status) = &ui.status {
-        f.render_widget(Line::from(Span::styled(format!(" {status}"), Style::new().fg(Color::Red))), foot);
+        Line::from(Span::styled(format!(" {status} "), Style::new().fg(BAD).add_modifier(Modifier::BOLD)))
     } else {
         let help = match ui.pane {
-            Pane::Menu => " ↑↓ move  ⏎ open/run/edit  ← back  l logs  r reload  q quit",
-            Pane::Logs => " ↑↓ PgUp PgDn scroll  g/G top/end  c clear  l back  q quit",
+            Pane::Menu => " ↑↓ move  ⏎ open/run/edit  ← back  l logs  r reload  q quit ",
+            Pane::Logs => " ↑↓ PgUp PgDn scroll  g/G top/end  c clear  l back  q quit ",
         };
-        f.render_widget(Line::from(Span::styled(help, dim)), foot);
+        Line::from(Span::styled(help, dim))
+    };
+    let frame = Block::bordered()
+        .border_style(Style::new().fg(EDGE))
+        .style(base)
+        .title_top(Line::from(Span::styled(format!(" {} ", snap.title), chip)))
+        .title_top(Line::from(format!(" {} ", snap.crumbs)).right_aligned())
+        .title_bottom(bottom);
+    let inner = frame.inner(area);
+    f.render_widget(frame, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let (menu_area, log_area) = split_body(inner, sh.log_percent());
+    draw_menu(f, ui, snap, menu_area);
+    if let Some(area) = log_area {
+        draw_logs(f, ui, sh, area);
+    }
+    if let Some(x) = cursor {
+        f.set_cursor_position(Position::new(x.min(area.right().saturating_sub(2)), area.bottom().saturating_sub(1)));
     }
 }
 
-fn draw_menu(f: &mut Frame, ui: &mut Ui, snap: &Snapshot, area: ratatui::layout::Rect) {
+/// The menu on top, the log list under it: `percent` of the body goes to the log list (its divider row included), the menu keeps the rest
+/// (at least one row). No log list (`None`) at 0%, or when the body is too short for a divider and a line.
+fn split_body(body: Rect, percent: u16) -> (Rect, Option<Rect>) {
+    let total = body.height;
+    let want = (u32::from(total) * u32::from(percent) / 100) as u16;
+    if total < 3 || want < 2 {
+        return (body, None);
+    }
+    let logs = want.min(total - 1);
+    let [menu, logs] = Layout::vertical([Constraint::Length(total - logs), Constraint::Length(logs)]).areas(body);
+    (menu, Some(logs))
+}
+
+fn draw_menu(f: &mut Frame, ui: &mut Ui, snap: &Snapshot, area: Rect) {
+    let dim = Style::new().fg(DIM);
     if snap.entries.is_empty() {
-        f.render_widget(Paragraph::new(Span::styled("  (empty)", Style::new().fg(Color::DarkGray))), area);
+        f.render_widget(Paragraph::new(Span::styled("  (empty)", dim)), area);
         return;
     }
     let width = snap.entries.iter().map(|e| e.name.chars().count()).max().unwrap_or(0);
-    let dim = Style::new().fg(Color::DarkGray);
     let items: Vec<ListItem> = snap
         .entries
         .iter()
@@ -785,47 +850,71 @@ fn draw_menu(f: &mut Frame, ui: &mut Ui, snap: &Snapshot, area: ratatui::layout:
             let name = format!("{:<width$}", e.name);
             ListItem::new(match &e.node {
                 Node::Menu(t) => Line::from(vec![
-                    Span::styled(format!("{}/", e.name), Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{}/", e.name), Style::new().add_modifier(Modifier::BOLD)),
                     Span::styled(format!("  {}", entries(t, false).len()), dim),
                 ]),
                 Node::Item { kind: Kind::OnCall, .. } => Line::from(Span::styled(name, dim)),
-                Node::Item { kind: Kind::Button, .. } => {
-                    Line::from(vec![Span::styled(name, Style::new().fg(Color::Green)), Span::styled("  ()", dim)])
-                }
+                Node::Item { kind: Kind::Button, .. } => Line::from(vec![Span::styled(name, Style::new().fg(GOOD)), Span::styled("  ()", dim)]),
                 Node::Item { table, kind } => Line::from(vec![
                     Span::raw(name),
                     Span::raw(" = "),
-                    Span::styled(item_text(*kind, &field(table, "Value")), Style::new().fg(Color::Yellow)),
+                    Span::styled(item_text(*kind, &field(table, "Value")), Style::new().fg(VALUE).add_modifier(Modifier::BOLD)),
                 ]),
-                Node::Bad(why) => Line::from(vec![Span::styled(name, dim), Span::styled(format!("  ! {why}"), Style::new().fg(Color::Red))]),
+                Node::Bad(why) => Line::from(vec![Span::styled(name, dim), Span::styled(format!("  ! {why}"), Style::new().fg(BAD))]),
             })
         })
         .collect();
     ui.list.select(Some(ui.cursor));
     f.render_stateful_widget(
-        List::new(items).highlight_symbol("▶ ").highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+        List::new(items).highlight_symbol("▶ ").highlight_style(Style::new().fg(Color::White).bg(BAR).add_modifier(Modifier::BOLD)),
         area,
         &mut ui.list,
     );
 }
 
-fn draw_logs(f: &mut Frame, ui: &mut Ui, sh: &Shared, area: ratatui::layout::Rect) {
-    let lines: Vec<String> = lock(&sh.logs)
-        .iter()
-        .flat_map(|(at, text)| {
-            let stamp = format!("[{}] ", fmt_elapsed(*at));
-            text.lines()
-                .enumerate()
-                .map(move |(i, l)| if i == 0 { format!("{stamp}{l}") } else { format!("        {l}") })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    if lines.is_empty() {
-        f.render_widget(Paragraph::new(Span::styled("  (no logs)", Style::new().fg(Color::DarkGray))), area);
-        return;
-    }
+/// The log list: a divider row that joins the box (`├ logs (n) ───┤`, lit while the log list has the keys; `↑k` when scrolled back k lines),
+/// then the newest lines that fit.
+fn draw_logs(f: &mut Frame, ui: &mut Ui, sh: &Shared, area: Rect) {
+    let [bar, area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let dim = Style::new().fg(DIM);
+    let (count, lines): (usize, Vec<String>) = {
+        let logs = lock(&sh.logs);
+        let lines = logs
+            .iter()
+            .flat_map(|(at, text)| {
+                let stamp = format!("[{}] ", fmt_elapsed(*at));
+                text.lines()
+                    .enumerate()
+                    .map(move |(i, l)| if i == 0 { format!("{stamp}{l}") } else { format!("        {l}") })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (logs.len(), lines)
+    };
     let height = area.height as usize;
     ui.log_back = ui.log_back.min(lines.len().saturating_sub(height));
+
+    let mut label = format!(" logs ({count}) ");
+    if ui.log_back > 0 {
+        label.push_str(&format!("↑{} ", ui.log_back));
+    }
+    let label_style = match ui.pane {
+        Pane::Logs => Style::new().add_modifier(Modifier::BOLD).fg(Color::White).bg(BAR),
+        Pane::Menu => dim,
+    };
+    let rule = "─".repeat((bar.width as usize).saturating_sub(label.chars().count()));
+    f.render_widget(Line::from(vec![Span::styled(label, label_style), Span::styled(rule, Style::new().fg(EDGE))]), bar);
+    // the box's side borders sit one column outside the divider: turn them into a junction
+    for (x, symbol) in [(bar.x.wrapping_sub(1), "├"), (bar.right(), "┤")] {
+        if let Some(cell) = f.buffer_mut().cell_mut((x, bar.y)) {
+            cell.set_symbol(symbol).set_style(Style::new().fg(EDGE));
+        }
+    }
+
+    if lines.is_empty() {
+        f.render_widget(Paragraph::new(Span::styled("  (no logs)", dim)), area);
+        return;
+    }
     let end = lines.len() - ui.log_back;
     let start = end.saturating_sub(height);
     let shown: Vec<Line> = lines[start..end].iter().map(|l| Line::from(l.as_str())).collect();
@@ -900,11 +989,15 @@ mod tests {
             self.ui.cursor = snap.entries.iter().position(|e| e.name == name).unwrap_or_else(|| panic!("no entry {name}"));
         }
 
-        fn screen(&mut self) -> String {
-            let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        fn buffer(&mut self) -> ratatui::buffer::Buffer {
+            let mut terminal = Terminal::new(TestBackend::new(56, 16)).unwrap();
             let snap = self.ui.snapshot(&self.sh);
             terminal.draw(|f| draw(f, &mut self.ui, &self.sh, &snap)).unwrap();
-            let buf = terminal.backend().buffer().clone();
+            terminal.backend().buffer().clone()
+        }
+
+        fn screen(&mut self) -> String {
+            let buf = self.buffer();
             (0..buf.area.height)
                 .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
                 .collect::<Vec<_>>()
@@ -1161,11 +1254,13 @@ mod tests {
         let logs: Vec<String> = r.eval("m:logs()");
         assert_eq!(logs, ["a", "b 2 true nil"]);
 
-        r.keys(&[KeyCode::Char('l')]);
         let s = r.screen();
-        assert!(s.contains("logs") && s.contains("] a") && s.contains("] b 2 true nil"), "{s}");
+        assert!(s.contains("logs (2)") && s.contains("] a") && s.contains("] b 2 true nil"), "always shown, under the menu: {s}");
+        assert!(r.ui.pane == Pane::Menu);
+        r.keys(&[KeyCode::Char('l')]);
+        assert!(r.ui.pane == Pane::Logs, "l gives the keys to the log list");
         r.keys(&[KeyCode::Char('c')]);
-        assert!(r.screen().contains("(no logs)"));
+        assert!(r.screen().contains("(no logs)") && r.screen().contains("logs (0)"));
         r.keys(&[KeyCode::Char('l')]);
         assert!(r.ui.pane == Pane::Menu);
 
@@ -1237,6 +1332,120 @@ mod tests {
         assert!(r.eval::<bool>("m:tree() == last and count == 1"));
         r.keys(&[KeyCode::Char('r')]);
         assert!(r.eval::<bool>("m:tree() == last and count == 2"));
+    }
+
+    /// The row (0-based) of the screen where the divider of the log list sits, if there is one.
+    fn divider_row(screen: &str) -> Option<usize> {
+        screen.lines().position(|l| l.contains(" logs ("))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_log_list_takes_the_bottom_half_and_the_share_is_live() {
+        let mut r = Rig::new(TREE);
+        // 16 rows: header, 14 body rows, footer. Half of the body is the log list, its divider on top of it.
+        let s = r.screen();
+        assert_eq!(divider_row(&s), Some(8), "menu rows 1..=7, divider on row 8, log lines 9..=14: {s}");
+        assert!(s.lines().next().unwrap().contains("test"), "{s}");
+        assert!(s.lines().last().unwrap().contains("move"), "the footer stays at the bottom: {s}");
+        assert!(r.eval::<bool>("m:conf().log_percent == 50"), "the default is filled in, so reading it works");
+
+        r.lua.load("m:conf().log_percent = 20").exec().unwrap();
+        assert_eq!(divider_row(&r.screen()), Some(13), "20% of 14 rows is 2: menu rows 1..=12, divider on row 13");
+
+        r.lua.load("m:conf().log_percent = 0").exec().unwrap();
+        assert_eq!(divider_row(&r.screen()), None, "0 hides the log list");
+        r.lua.load("m:conf().log_percent = 500").exec().unwrap();
+        assert_eq!(divider_row(&r.screen()), Some(3), "clamped to 90%: the menu keeps its rows (14 * 90% = 12 -> menu rows 1..=2)");
+        r.lua.load("m:conf().log_percent = nil").exec().unwrap();
+        assert_eq!(divider_row(&r.screen()), Some(8), "not a number: the default");
+        r.lua.load("m:conf().log_percent = 'wide'").exec().unwrap();
+        assert_eq!(divider_row(&r.screen()), Some(8), "a string: the default");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_screen_is_a_box_on_luau_blue() {
+        let mut r = Rig::new(TREE);
+        let buf = r.buffer();
+        let (w, h) = (buf.area.width, buf.area.height);
+        let at = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+        assert_eq!([at(0, 0), at(w - 1, 0), at(0, h - 1), at(w - 1, h - 1)], ["┌", "┐", "└", "┘"], "the four corners");
+        assert_eq!([at(0, 3), at(w - 1, 3), at(30, 0)], ["│", "│", "─"], "sides and top");
+        assert_eq!([at(0, 8), at(w - 1, 8), at(30, 8)], ["├", "┤", "─"], "the divider joins the box");
+
+        // every cell is Luau blue, but the title chip (top border) and the selected row
+        let off: Vec<(u16, u16)> = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| buf[(x, y)].bg != BG).collect();
+        assert!(off.iter().all(|&(_, y)| y <= 1), "only the title chip and the selected row differ: {off:?}");
+        assert!(off.iter().any(|&(_, y)| y == 1), "the selected row has its bar");
+        assert_eq!(BG, Color::Rgb(0, 0xA2, 0xFF));
+        assert_eq!(buf[(30, 5)].bg, BG, "an empty menu cell");
+        assert_eq!(buf[(30, 12)].bg, BG, "an empty log cell");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_value_being_edited_and_problems_show_in_the_bottom_border() {
+        let mut r = Rig::new(TREE);
+        r.select("config");
+        r.keys(&[KeyCode::Enter]);
+        r.select("retries");
+        r.keys(&[KeyCode::Enter]);
+        let s = r.screen();
+        assert!(s.lines().last().unwrap().contains("config/retries = 3"), "the editor sits in the bottom border: {s}");
+        r.keys(&[KeyCode::Esc]);
+        r.select("Reconnect");
+        r.lua.load("tree.config[5].Func = nil; tree.config[5].Callback = nil").exec().unwrap();
+        r.keys(&[KeyCode::Enter]);
+        assert!(r.screen().lines().last().unwrap().contains("has no Func"), "a problem too");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_short_screen_drops_the_log_list_and_the_menu_keeps_a_row() {
+        // no room for a divider and a line: only the menu is drawn
+        assert_eq!(split_body(Rect::new(0, 1, 40, 2), 50), (Rect::new(0, 1, 40, 2), None));
+        assert_eq!(split_body(Rect::new(0, 1, 40, 14), 0), (Rect::new(0, 1, 40, 14), None));
+        let (menu, logs) = split_body(Rect::new(0, 1, 40, 14), 50);
+        assert_eq!((menu.height, logs.unwrap().height), (7, 7));
+        let (menu, logs) = split_body(Rect::new(0, 1, 40, 3), 90);
+        assert_eq!((menu.height, logs.unwrap().height), (1, 2), "the menu keeps at least one row");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_log_list_scrolls_when_it_has_the_keys_and_follows_the_newest_line_otherwise() {
+        let mut r = Rig::new(TREE);
+        r.lua.load("for i = 1, 30 do m:log('line ' .. i) end").exec().unwrap();
+        let s = r.screen();
+        let divider = s.lines().nth(divider_row(&s).unwrap()).unwrap();
+        assert!(s.contains("line 30") && !s.contains("line 1 ") && !divider.contains('↑'), "the newest lines, not scrolled: {s}");
+
+        r.keys(&[KeyCode::Tab]);
+        assert!(r.ui.pane == Pane::Logs);
+        r.keys(&[KeyCode::Up, KeyCode::Up, KeyCode::Up]);
+        let s = r.screen();
+        assert!(s.contains("↑3") && !s.contains("line 30") && s.contains("line 27"), "scrolled back 3 lines: {s}");
+        r.keys(&[KeyCode::Home]);
+        assert!(r.screen().contains("line 1 ") || r.screen().contains("] line 1"), "g / Home: the oldest line");
+        r.keys(&[KeyCode::End]);
+        assert!(r.screen().contains("line 30"));
+
+        r.keys(&[KeyCode::Up, KeyCode::Esc]);
+        assert!(r.ui.pane == Pane::Menu && r.ui.log_back == 0, "back to the menu: following the newest line again");
+        assert!(r.screen().contains("line 30"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hidden_log_list_cannot_take_the_keys() {
+        let mut r = Rig::new(TREE);
+        r.lua.load("m:conf().log_percent = 0").exec().unwrap();
+        r.keys(&[KeyCode::Char('l')]);
+        assert!(r.ui.pane == Pane::Menu, "nothing to scroll");
+        assert!(r.ui.status.as_deref().unwrap_or("").contains("hidden"));
+
+        // hidden by the script while it had the keys: they go back to the menu
+        r.lua.load("m:conf().log_percent = 50").exec().unwrap();
+        r.keys(&[KeyCode::Char('l')]);
+        assert!(r.ui.pane == Pane::Logs);
+        r.lua.load("m:conf().log_percent = 0").exec().unwrap();
+        r.screen();
+        assert!(r.ui.pane == Pane::Menu);
     }
 
     #[tokio::test(flavor = "multi_thread")]
