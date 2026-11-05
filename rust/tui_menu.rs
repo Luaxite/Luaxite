@@ -12,6 +12,7 @@
 //           { Type = "Boolean", Name = "debug",   Value = false, Func = function(on) end },
 //           { Type = "Number",  Name = "retries", Value = 3 },
 //           { Type = "String",  Name = "host",    Value = "localhost" },
+//           { Type = "Dropdown", Name = "mode",   Options = { "easy", "normal", "hard" }, Value = "normal", Func = function(choice) end },
 //           { Type = "Button",  Name = "Reconnect", Func = function(a, b) end, Args = { "x", "y" } },
 //           { Name = "network",                              -- a nested menu named by its `Name`: an array, no Type
 //               { Type = "OnCall", Func = function(a) end, Args = { "opened" } },
@@ -34,6 +35,9 @@
 // Items (`Type` is case-insensitive; field names may be `Name` or `name`, and so on; `Func` may also be spelled `Callback`):
 //   Number / String / Boolean   `Value` is shown and edited in the menu (Enter; a Boolean toggles). The new value is written back into `Value`
 //                               of your table, then `Func(newValue, table.unpack(Args))` runs if there is one.
+//   Dropdown                    `Options` is an array of strings, numbers or booleans and `Value` the chosen one. Enter opens the list (↑↓ choose,
+//                               Enter select, Esc cancel). The choice is written back into `Value` as the same Lua value, then
+//                               `Func(choice, table.unpack(Args))` runs (not when the choice is the value it already had).
 //   Button (or Function)        Enter runs `Func(table.unpack(Args))`.
 //   OnCall                      `Func(table.unpack(Args))` runs each time the menu it sits in is opened from its parent. It is not listed.
 //                               It is only allowed in a nested menu: in the main (root) menu it is shown as an error and never runs.
@@ -59,7 +63,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 /// Log lines kept; the oldest is dropped first.
@@ -314,6 +318,8 @@ enum Kind {
     Number,
     Text,
     Toggle,
+    /// A list of choices (`Options`) opened with Enter.
+    Dropdown,
     Button,
     /// A hook: runs when the menu it sits in is opened. Never listed.
     OnCall,
@@ -324,6 +330,7 @@ fn kind_of(name: &str) -> Option<Kind> {
         "number" => Some(Kind::Number),
         "string" => Some(Kind::Text),
         "boolean" => Some(Kind::Toggle),
+        "dropdown" => Some(Kind::Dropdown),
         "button" | "function" => Some(Kind::Button),
         "oncall" => Some(Kind::OnCall),
         _ => None,
@@ -369,8 +376,12 @@ fn classify(value: &Value) -> Node {
         Value::String(s) => {
             let s = s.to_string_lossy();
             match kind_of(&s) {
+                Some(Kind::Dropdown) => match dropdown_options(t) {
+                    Ok(_) => Node::Item { table: t.clone(), kind: Kind::Dropdown },
+                    Err(why) => Node::Bad(why),
+                },
                 Some(kind) => Node::Item { table: t.clone(), kind },
-                None => Node::Bad(format!("unknown Type \"{s}\" (Number, String, Boolean, Button, OnCall)")),
+                None => Node::Bad(format!("unknown Type \"{s}\" (Number, String, Boolean, Dropdown, Button, OnCall)")),
             }
         }
         _ => Node::Menu(t.clone()),
@@ -447,11 +458,54 @@ fn show(value: &Value) -> String {
     }
 }
 
+/// A choice of a dropdown as the row and the list show it: a string as it is, a number or a boolean as `show` has it.
+fn option_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.to_string_lossy().replace('\n', "\\n"),
+        other => show(other),
+    }
+}
+
+/// `Options` of a dropdown: a non-empty array of strings, numbers or booleans.
+fn dropdown_options(t: &Table) -> Result<Vec<Value>, String> {
+    let Value::Table(list) = field(t, "Options") else {
+        return Err("Dropdown needs Options = { ... } (an array)".into());
+    };
+    let options = list.sequence_values::<Value>().collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    if options.is_empty() {
+        return Err("Options is empty".into());
+    }
+    match options.iter().find(|v| !matches!(v, Value::String(_) | Value::Integer(_) | Value::Number(_) | Value::Boolean(_))) {
+        Some(bad) => Err(format!("Options must be strings, numbers or booleans, got {}", lua_type(bad))),
+        None => Ok(options),
+    }
+}
+
+fn as_f64(v: &Value) -> f64 {
+    match v {
+        Value::Integer(i) => *i as f64,
+        Value::Number(n) => *n,
+        _ => f64::NAN,
+    }
+}
+
+/// Whether two values are the same choice (numbers by value: Luau does not tell integers from floats).
+fn same_choice(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => x.to_string_lossy() == y.to_string_lossy(),
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Integer(_) | Value::Number(_), Value::Integer(_) | Value::Number(_)) => as_f64(a) == as_f64(b),
+        _ => false,
+    }
+}
+
 /// The `Value` of an item as the list shows it (an item without one shows its type's default).
 fn item_text(kind: Kind, value: &Value) -> String {
     match (value, kind) {
         (Value::Nil, Kind::Number) => "0".into(),
         (Value::Nil, Kind::Text) => "\"\"".into(),
+        (Value::Nil, Kind::Dropdown) => "(none)".into(),
+        (v, Kind::Dropdown) => option_text(v),
         (Value::Nil, _) => "false".into(),
         (v, _) => show(v),
     }
@@ -547,6 +601,15 @@ struct Edit {
     pos: usize,
 }
 
+/// An open dropdown: its choices and the highlighted one.
+struct Pick {
+    item: Table,
+    label: String,
+    options: Vec<Value>,
+    cursor: usize,
+    list: ListState,
+}
+
 #[derive(Default)]
 struct Ui {
     path: Vec<(Selector, String)>,
@@ -554,6 +617,7 @@ struct Ui {
     list: ListState,
     pane: Pane,
     edit: Option<Edit>,
+    pick: Option<Pick>,
     status: Option<String>,
     /// Log lines scrolled up from the newest.
     log_back: usize,
@@ -602,6 +666,9 @@ impl Ui {
     fn key(&mut self, sh: &Arc<Shared>, ev: KeyEvent) {
         self.status = None;
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+        if self.pick.is_some() {
+            return self.pick_key(sh, ev, ctrl);
+        }
         if self.edit.is_some() {
             return self.edit_key(sh, ev, ctrl);
         }
@@ -685,7 +752,7 @@ impl Ui {
         self.cursor = snap.entries.iter().position(|e| e.name == left).unwrap_or(0);
     }
 
-    /// Enter on an entry: open a menu, press a button, toggle a boolean, edit a number or a string.
+    /// Enter on an entry: open a menu, press a button, toggle a boolean, open a dropdown, edit a number or a string.
     fn activate(&mut self, sh: &Arc<Shared>, entry: Entry) {
         let label = join_path(&self.path, Some(&entry.name));
         match entry.node {
@@ -706,6 +773,14 @@ impl Ui {
                 let on = matches!(field(&table, "Value"), Value::Boolean(true));
                 change(sh, &table, label, Value::Boolean(!on));
             }
+            Node::Item { table, kind: Kind::Dropdown } => match dropdown_options(&table) {
+                Ok(options) => {
+                    let current = field(&table, "Value");
+                    let cursor = options.iter().position(|o| same_choice(o, &current)).unwrap_or(0);
+                    self.pick = Some(Pick { item: table, label, options, cursor, list: ListState::default() });
+                }
+                Err(why) => self.status = Some(format!("{label}: {why}")),
+            },
             Node::Item { table, kind } => {
                 let text = match field(&table, "Value") {
                     Value::Nil => String::new(),
@@ -718,6 +793,30 @@ impl Ui {
                 let pos = buf.len();
                 self.edit = Some(Edit { item: table, label, numeric: kind == Kind::Number, buf, pos });
             }
+        }
+    }
+
+    /// Keys while a dropdown is open: choose with the arrows, Enter selects, Esc cancels.
+    fn pick_key(&mut self, sh: &Arc<Shared>, ev: KeyEvent, ctrl: bool) {
+        let Some(pick) = self.pick.as_mut() else { return };
+        let last = pick.options.len().saturating_sub(1);
+        match ev.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.pick = None,
+            KeyCode::Char('c') if ctrl => self.pick = None,
+            KeyCode::Up | KeyCode::Char('k') => pick.cursor = pick.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => pick.cursor = (pick.cursor + 1).min(last),
+            KeyCode::PageUp => pick.cursor = pick.cursor.saturating_sub(10),
+            KeyCode::PageDown => pick.cursor = (pick.cursor + 10).min(last),
+            KeyCode::Home | KeyCode::Char('g') => pick.cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => pick.cursor = last,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Pick { item, label, options, cursor, .. } = self.pick.take().expect("pick is set");
+                let choice = options[cursor.min(last)].clone();
+                if !same_choice(&choice, &field(&item, "Value")) {
+                    change(sh, &item, label, choice);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -830,6 +929,8 @@ fn draw(f: &mut Frame, ui: &mut Ui, sh: &Shared, snap: &Snapshot) {
         let text: String = edit.buf.iter().collect();
         cursor = Some(area.x + 1 + (prefix.chars().count() + edit.pos) as u16); // just right of the corner
         Line::from(vec![Span::styled(prefix, dim), Span::styled(format!("{text} "), Style::new().add_modifier(Modifier::BOLD))])
+    } else if ui.pick.is_some() {
+        Line::from(Span::styled(" ↑↓ choose  ⏎ select  esc cancel ", dim))
     } else if let Some(status) = &ui.status {
         Line::from(Span::styled(format!(" {status} "), Style::new().fg(BAD).add_modifier(Modifier::BOLD)))
     } else {
@@ -855,6 +956,9 @@ fn draw(f: &mut Frame, ui: &mut Ui, sh: &Shared, snap: &Snapshot) {
     draw_menu(f, ui, snap, menu_area);
     if let Some(area) = log_area {
         draw_logs(f, ui, sh, area);
+    }
+    if let Some(pick) = ui.pick.as_mut() {
+        draw_pick(f, pick, inner);
     }
     if let Some(x) = cursor {
         f.set_cursor_position(Position::new(x.min(area.right().saturating_sub(2)), area.bottom().saturating_sub(1)));
@@ -893,6 +997,12 @@ fn draw_menu(f: &mut Frame, ui: &mut Ui, snap: &Snapshot, area: Rect) {
                 ]),
                 Node::Item { kind: Kind::OnCall, .. } => Line::from(Span::styled(name, dim)),
                 Node::Item { kind: Kind::Button, .. } => Line::from(vec![Span::styled(name, Style::new().fg(GOOD)), Span::styled("  ()", dim)]),
+                Node::Item { table, kind: Kind::Dropdown } => Line::from(vec![
+                    Span::raw(name),
+                    Span::raw(" = "),
+                    Span::styled(item_text(Kind::Dropdown, &field(table, "Value")), Style::new().fg(VALUE).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ▾", dim),
+                ]),
                 Node::Item { table, kind } => Line::from(vec![
                     Span::raw(name),
                     Span::raw(" = "),
@@ -907,6 +1017,34 @@ fn draw_menu(f: &mut Frame, ui: &mut Ui, snap: &Snapshot, area: Rect) {
         List::new(items).highlight_symbol("▶ ").highlight_style(Style::new().fg(Color::White).bg(BAR).add_modifier(Modifier::BOLD)),
         area,
         &mut ui.list,
+    );
+}
+
+/// An open dropdown: a bordered list of the choices in the middle of the box, the highlighted one on the bar, the current value marked `●`.
+fn draw_pick(f: &mut Frame, pick: &mut Pick, area: Rect) {
+    let current = field(&pick.item, "Value");
+    let texts: Vec<String> = pick.options.iter().map(option_text).collect();
+    let items: Vec<ListItem> = pick
+        .options
+        .iter()
+        .zip(&texts)
+        .map(|(o, t)| ListItem::new(format!("{}{t}", if same_choice(o, &current) { "● " } else { "  " })))
+        .collect();
+    // border (2) + highlight symbol (2) + marker (2) around the widest choice
+    let wide = texts.iter().map(|t| t.chars().count()).max().unwrap_or(0).max(pick.label.chars().count());
+    let w = u16::try_from(wide + 6).unwrap_or(u16::MAX).min(area.width);
+    let h = u16::try_from(texts.len()).unwrap_or(u16::MAX).saturating_add(2).min(area.height);
+    let popup = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(EDGE))
+        .style(Style::new().fg(INK).bg(BG))
+        .title_top(Line::from(format!(" {} ", pick.label)));
+    pick.list.select(Some(pick.cursor));
+    f.render_stateful_widget(
+        List::new(items).block(block).highlight_symbol("▶ ").highlight_style(Style::new().fg(Color::White).bg(BAR).add_modifier(Modifier::BOLD)),
+        popup,
+        &mut pick.list,
     );
 }
 
@@ -1323,6 +1461,69 @@ mod tests {
         let s = r.screen();
         assert!(s.contains("[3] last"), "the newest entry is numbered: {s}");
         assert!(s.lines().all(|l| l.chars().count() <= 56), "{s}");
+    }
+
+    const DROP: &str = r#"
+        tree = {
+            { Type = "Dropdown", Name = "mode", Options = { "easy", "normal", "hard" }, Value = "normal",
+              Func = function(v, tag) picked = { v, tag } end, Args = { "m" } },
+            { Type = "dropdown", Name = "level", Options = { 1, 2.5, 10 }, Value = 2.5 },
+            { Type = "Dropdown", Name = "flag", Options = { true, false } },
+        }
+        m = menu.new(tree, { title = "test" })
+    "#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropdown_lists_its_choices_and_writes_the_pick_back() {
+        let mut r = Rig::new(DROP);
+        let s = r.screen();
+        assert!(s.contains("= normal ▾") && s.contains("= 2.5 ▾") && s.contains("= (none) ▾"), "{s}");
+
+        r.keys(&[KeyCode::Enter]);
+        assert!(r.ui.pick.as_ref().is_some_and(|p| p.cursor == 1), "the list starts on the current value");
+        let s = r.screen();
+        assert!(s.contains("easy") && s.contains("● normal") && s.contains("hard") && s.contains("esc cancel"), "{s}");
+
+        r.keys(&[KeyCode::Down, KeyCode::Enter]);
+        assert!(r.ui.pick.is_none());
+        assert!(r.eval::<bool>("tree[1].Value == 'hard'"), "written into the caller's table");
+        r.until("picked ~= nil").await;
+        assert!(r.eval::<bool>("picked[1] == 'hard' and picked[2] == 'm'"), "Func(choice, table.unpack(Args))");
+        assert!(r.screen().contains("= hard ▾"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropdown_keeps_the_type_of_its_choices_and_can_be_cancelled() {
+        let mut r = Rig::new(DROP);
+        r.select("level");
+        r.keys(&[KeyCode::Enter, KeyCode::Down, KeyCode::Enter]);
+        assert!(r.eval::<bool>("tree[2].Value == 10 and type(tree[2].Value) == 'number'"));
+
+        r.keys(&[KeyCode::Enter, KeyCode::Up, KeyCode::Esc]);
+        assert!(r.ui.pick.is_none() && !r.ui.quit, "Esc closes the list and does not quit");
+        assert!(r.eval::<bool>("tree[2].Value == 10"), "cancelled: nothing written");
+
+        r.select("flag"); // no Value yet: the list starts on the first choice
+        r.keys(&[KeyCode::Enter, KeyCode::Down, KeyCode::Enter]);
+        assert!(r.eval::<bool>("tree[3].Value == false"), "a boolean stays a boolean");
+
+        // choosing the value it already has runs nothing
+        r.select("mode");
+        r.keys(&[KeyCode::Enter, KeyCode::Enter]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(r.eval::<bool>("picked == nil and tree[1].Value == 'normal'"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropdown_without_usable_options_is_shown_as_an_error() {
+        let mut r = Rig::new(
+            "tree = { { Type = 'Dropdown', Name = 'a' }, { Type = 'Dropdown', Name = 'b', Options = {} }, { Type = 'Dropdown', Name = 'c', Options = { {} } } }; m = menu.new(tree)",
+        );
+        let s = r.screen();
+        assert!(s.contains("needs Options") && s.contains("Options is empty") && s.contains("must be strings"), "{s}");
+        r.select("c");
+        r.keys(&[KeyCode::Enter]);
+        assert!(r.ui.pick.is_none() && r.ui.status.as_deref().unwrap_or("").contains("Options must be"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
