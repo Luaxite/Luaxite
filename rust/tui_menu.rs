@@ -23,6 +23,7 @@
 //   m:open()                 -- starts the menu on its own thread and returns at once; the script keeps running
 //   m:log("connected", 42)   -- append a line to the log (values are joined with spaces, like print)
 //   print(#m:logs())         -- the log as an array of strings (the newest 1000 lines are kept)
+//                            -- the log list shows entry N as `[N] text` (N = its index in m:logs()); long text wraps to the screen width
 //   m:clear_logs()
 //   m:wait()                 -- yields until the menu is closed (q / Ctrl-C / m:close())
 //   m:close()  m:is_open()
@@ -48,11 +49,10 @@
 // While the menu is open it owns the terminal (alternate screen): use `m:log` instead of `print`. Callbacks run in their own Luau thread, so
 // they may yield (`task.wait`, `bot:...`); an error they raise is logged. Keys are listed in the footer of the menu.
 
-use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, Value, Variadic};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -113,8 +113,8 @@ struct Shared {
     root: Mutex<Option<Table>>,
     /// The options table (`menu.new`'s 2nd argument): `title` is read from it on every frame.
     conf: Table,
-    started: Instant,
-    logs: Mutex<VecDeque<(Duration, String)>>,
+    /// The log: an array, entry N is `logs[N - 1]`. The oldest entry is dropped first.
+    logs: Mutex<Vec<String>>,
     open: AtomicBool,
     stop: AtomicBool,
     rt: tokio::runtime::Handle,
@@ -124,9 +124,9 @@ impl Shared {
     fn log(&self, text: impl Into<String>) {
         let mut logs = lock(&self.logs);
         if logs.len() >= MAX_LOGS {
-            logs.pop_front();
+            logs.remove(0);
         }
-        logs.push_back((self.started.elapsed(), text.into()));
+        logs.push(text.into());
     }
 
     fn load_root(&self) -> mlua::Result<Table> {
@@ -194,8 +194,7 @@ impl Menu {
             source,
             root: Mutex::new(None),
             conf,
-            started: Instant::now(),
-            logs: Mutex::new(VecDeque::new()),
+            logs: Mutex::new(Vec::new()),
             open: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             rt,
@@ -264,7 +263,7 @@ impl UserData for Menu {
             Ok(())
         });
         methods.add_method("logs", |lua, this, ()| {
-            let lines: Vec<String> = lock(&this.0.logs).iter().map(|(_, text)| text.clone()).collect();
+            let lines: Vec<String> = lock(&this.0.logs).clone();
             lua.create_sequence_from(lines)
         });
         methods.add_method("clear_logs", |_, this, ()| {
@@ -773,9 +772,48 @@ impl Ui {
 // drawing
 // ---------------------------------------------------------------------------------------------------------------------------------------
 
-fn fmt_elapsed(d: Duration) -> String {
-    let s = d.as_secs();
-    format!("{:02}:{:02}", s / 60 % 100, s % 60)
+/// Columns one char takes on screen (0 for a combining mark, 2 for a wide char).
+fn char_width(c: char) -> usize {
+    let mut buf = [0u8; 4];
+    Span::raw(&*c.encode_utf8(&mut buf)).width()
+}
+
+/// The log as screen rows, each at most `width` columns: entry N (1-based, its index in `m:logs()`) starts with `[N] `, text that does not fit
+/// continues on the next rows flush left, and a newline in the text starts a new row.
+///
+///   [1] Text
+///   [2] really longgggggg
+///   ggggggggggggggggg
+///   text
+///   [3] test
+fn wrap_logs(logs: &[String], width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for (i, text) in logs.iter().enumerate() {
+        let full = format!("[{}] {}", i + 1, text.trim_end_matches(['\n', '\r']).replace('\t', "    "));
+        let mut row = String::new();
+        let mut cols = 0;
+        for c in full.chars() {
+            if c == '\n' {
+                rows.push(std::mem::take(&mut row));
+                cols = 0;
+                continue;
+            }
+            if c.is_control() {
+                continue;
+            }
+            let w = char_width(c);
+            // a char that does not fit moves to the next row (a row always takes at least one char, so a too-narrow screen cannot loop)
+            if cols + w > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                cols = 0;
+            }
+            row.push(c);
+            cols += w;
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// The whole screen is one box: the title top left, the path top right, the menu and the log list inside, and at the bottom the key help
@@ -879,17 +917,7 @@ fn draw_logs(f: &mut Frame, ui: &mut Ui, sh: &Shared, area: Rect) {
     let dim = Style::new().fg(DIM);
     let (count, lines): (usize, Vec<String>) = {
         let logs = lock(&sh.logs);
-        let lines = logs
-            .iter()
-            .flat_map(|(at, text)| {
-                let stamp = format!("[{}] ", fmt_elapsed(*at));
-                text.lines()
-                    .enumerate()
-                    .map(move |(i, l)| if i == 0 { format!("{stamp}{l}") } else { format!("        {l}") })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        (logs.len(), lines)
+        (logs.len(), wrap_logs(&logs, area.width as usize))
     };
     let height = area.height as usize;
     ui.log_back = ui.log_back.min(lines.len().saturating_sub(height));
@@ -1269,6 +1297,32 @@ mod tests {
         assert_eq!(r.eval::<String>("m:logs()[1]"), "line 501");
         r.lua.load("m:clear_logs()").exec().unwrap();
         assert_eq!(r.eval::<usize>("#m:logs()"), 0);
+    }
+
+    #[test]
+    fn logs_are_numbered_and_wrapped_to_the_width() {
+        let logs: Vec<String> = ["Text", "really longgggggggggggggggggggggggg text", "test"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            wrap_logs(&logs, 20),
+            ["[1] Text", "[2] really longggggg", "ggggggggggggggggggg ", "text", "[3] test"].map(String::from),
+            "the first row of an entry has [N], the rest are flush left"
+        );
+        for w in [1, 2, 5, 7, 20, 80] {
+            assert!(wrap_logs(&logs, w).iter().all(|r| r.chars().count() <= w), "width {w}");
+        }
+        // a newline starts a new row, a trailing one does not
+        assert_eq!(wrap_logs(&["a\nb\n".into()], 10), ["[1] a", "b"].map(String::from));
+        // wide chars count two columns and are never split
+        assert_eq!(wrap_logs(&["日本語".into()], 7), ["[1] 日", "本語"].map(String::from));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_log_list_shows_numbered_lines_that_fit_the_screen() {
+        let mut r = Rig::new(TREE);
+        r.lua.load("m:log('short'); m:log(string.rep('x', 200)); m:log('last')").exec().unwrap();
+        let s = r.screen();
+        assert!(s.contains("[3] last"), "the newest entry is numbered: {s}");
+        assert!(s.lines().all(|l| l.chars().count() <= 56), "{s}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
