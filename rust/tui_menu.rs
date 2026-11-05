@@ -34,7 +34,8 @@
 //
 // Items (`Type` is case-insensitive; field names may be `Name` or `name`, and so on; `Func` may also be spelled `Callback`):
 //   Number / String / Boolean   `Value` is shown and edited in the menu (Enter; a Boolean toggles). The new value is written back into `Value`
-//                               of your table, then `Func(newValue, table.unpack(Args))` runs if there is one.
+//                               of your table, then `Func(newValue, table.unpack(Args))` runs if there is one. While typing, Enter saves; Esc,
+//                               Tab, ↑, ↓, Ctrl-C and Ctrl-Q leave the input and write nothing.
 //   Dropdown                    `Options` is an array of strings, numbers or booleans and `Value` the chosen one. Enter opens the list (↑↓ choose,
 //                               Enter select, Esc cancel). The choice is written back into `Value` as the same Lua value, then
 //                               `Func(choice, table.unpack(Args))` runs (not when the choice is the value it already had).
@@ -823,8 +824,9 @@ impl Ui {
     fn edit_key(&mut self, sh: &Arc<Shared>, ev: KeyEvent, ctrl: bool) {
         let Some(edit) = self.edit.as_mut() else { return };
         match ev.code {
-            KeyCode::Esc => self.edit = None,
-            KeyCode::Char('c') if ctrl => self.edit = None,
+            // ways out of an input without writing anything (a phone keyboard has no Esc: Tab, the arrows and Ctrl-Q are there too)
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Up | KeyCode::Down => self.edit = None,
+            KeyCode::Char('c' | 'q') if ctrl => self.edit = None,
             KeyCode::Enter => {
                 let text: String = edit.buf.iter().collect();
                 let value = if edit.numeric {
@@ -946,6 +948,11 @@ fn draw(f: &mut Frame, ui: &mut Ui, sh: &Shared, snap: &Snapshot) {
         .title_top(Line::from(Span::styled(format!(" {} ", snap.title), chip)))
         .title_top(Line::from(format!(" {} ", snap.crumbs)).right_aligned())
         .title_bottom(bottom);
+    let frame = if ui.edit.is_some() {
+        frame.title_bottom(Line::from(Span::styled(" ⏎ ok  esc cancel ", dim)).right_aligned())
+    } else {
+        frame
+    };
     let inner = frame.inner(area);
     f.render_widget(frame, area);
     if inner.width == 0 || inner.height == 0 {
@@ -1524,6 +1531,27 @@ mod tests {
         r.select("c");
         r.keys(&[KeyCode::Enter]);
         assert!(r.ui.pick.is_none() && r.ui.status.as_deref().unwrap_or("").contains("Options must be"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_input_can_be_left_without_writing_anything() {
+        let mut r = Rig::new(TREE);
+        r.select("config");
+        r.keys(&[KeyCode::Enter]);
+        r.select("host");
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let leave: [KeyEvent; 6] =
+            [press_key(KeyCode::Esc), press_key(KeyCode::Tab), press_key(KeyCode::Up), press_key(KeyCode::Down), ctrl('c'), ctrl('q')];
+        for ev in leave {
+            r.keys(&[KeyCode::Enter]);
+            assert!(r.ui.edit.is_some());
+            r.type_text("zzz");
+            assert!(r.screen().contains("esc cancel"), "the way out is shown while typing");
+            r.ui.key(&r.sh, ev);
+            assert!(r.ui.edit.is_none(), "{ev:?} leaves the input");
+            assert!(!r.ui.quit, "and does not quit the menu");
+            assert!(r.eval::<bool>("tree.config[4].Value == 'localhost'"), "nothing written");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
