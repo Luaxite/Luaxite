@@ -69,6 +69,7 @@ end)
 ## Luau
 
 Scripts have access to azalea global and can `require` other files and `@lune/*` modules.
+The nine Lune modules are also globals (`datetime`, `fs`, `luau`, `net`, `process`, `regex`, `serde`, `stdio`, `task`), the same tables `require("@lune/<name>")` returns. `process.exit(code)` is part of `process`.
 
 `require` of files is relative to the script or module that calls it, not to the directory you run `luaxite` from:
 

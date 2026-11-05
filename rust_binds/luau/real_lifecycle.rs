@@ -253,17 +253,20 @@ pub fn install(lua: &Lua) -> mlua::Result<Arc<Live>> {
         })?,
     )?;
 
-    let process = lua.create_table()?;
-    // luau[ProcessLib]: --- Ends the process at once with exit code `code` (default 0), whatever bots / swarms are still running.
-    // luau[ProcessLib]: exit: (code: number?) -> ()
-    process.set(
-        "exit",
-        lua.create_function(|_, code: Option<i32>| -> mlua::Result<()> {
-            super::Runtime::kill_children();
-            std::process::exit(code.unwrap_or(0))
-        })?,
-    )?;
-    lua.globals().set("process", process)?;
+    // With the `lune` feature the `process` global is Lune's `process` module (it already has `exit`, see lune_process.rs). Only a build
+    // without it keeps this minimal table so scripts can still end the process.
+    #[cfg(not(feature = "lune"))]
+    {
+        let process = lua.create_table()?;
+        process.set(
+            "exit",
+            lua.create_function(|_, code: Option<i32>| -> mlua::Result<()> {
+                super::Runtime::kill_children();
+                std::process::exit(code.unwrap_or(0))
+            })?,
+        )?;
+        lua.globals().set("process", process)?;
+    }
 
     lua.globals().set("azalea", t)?;
     Ok(live)

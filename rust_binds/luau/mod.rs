@@ -495,6 +495,11 @@ impl Runtime {
         let lua = Lua::new();
         install_coroutine_shim(&lua).context("installing coroutine shim")?;
         install_require(&lua).context("installing require")?;
+        #[cfg(feature = "lune")]
+        {
+            let loaded: mlua::Table = lua.named_registry_value("azalea_loaded")?;
+            lune_libs::install_globals(&lua, &loaded).context("installing the @lune globals")?;
+        }
         binds::register(&lua).context("registering #[bind] functions")?;
         *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(lua.clone());
         Ok(Self {

@@ -101,6 +101,21 @@ pub fn require(lua: &Lua, loaded: &Table, name: &str) -> mlua::Result<Value> {
     Ok(value)
 }
 
+/// The Lune modules that are also globals, under the name after `@lune/` (`fs`, `net`, `process`, ...).
+const GLOBAL_MODULES: &[&str] = &[
+    "datetime", "fs", "luau", "net", "process", "regex", "serde", "stdio", "task",
+];
+
+/// Sets every module of `GLOBAL_MODULES` as a global. The global is the table `require("@lune/<n>")` returns (same `loaded` cache), so
+/// `fs == require("@lune/fs")`. Call it once per state, after `loaded` exists and before anything else sets a global of these names.
+pub fn install_globals(lua: &Lua, loaded: &Table) -> mlua::Result<()> {
+    for name in GLOBAL_MODULES {
+        let module = require(lua, loaded, name)?;
+        lua.globals().set(*name, module)?;
+    }
+    Ok(())
+}
+
 fn available() -> &'static str {
     "datetime, fs, luau, net, process, regex, serde, stdio, task"
 }
